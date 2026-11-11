@@ -48,7 +48,12 @@ type Options struct {
 	// that Launchpad says was live in [After, Before]: the versions a build
 	// at that time could have installed, which the live mirror no longer has.
 	History *History
+
+	followDepth int // symlink-following recursion level (internal)
 }
+
+// maxFollow bounds symlink chains followed in targeted mode.
+const maxFollow = 3
 
 // History selects historical versions from Launchpad.
 type History struct {
@@ -243,16 +248,8 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 	}()
 	go func() { wg.Wait(); close(results) }()
 
-	done := 0
-	for r := range results {
-		done++
+	save := func(r result) error {
 		s := r.pd.stanza
-		rep.Bytes += r.bytes
-		if r.err != nil {
-			rep.Failed = append(rep.Failed, fmt.Sprintf("%s %s: %v", s.Package, s.Version, r.err))
-			fmt.Fprintf(o.Log, "[%d/%d] FAIL %s %s: %v\n", done, len(todo), s.Package, s.Version, r.err)
-			continue
-		}
 		meta := store.PackageMeta{
 			DebSHA256: s.SHA256, Name: s.Package, Version: s.Version, Arch: s.Architecture,
 			Source: s.Source, SourceVersion: s.SourceVersion, Filename: s.Filename, Size: r.bytes,
@@ -267,23 +264,129 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 		}
 		id, err := st.AddPackage(ctx, meta, r.pd.pubs[0], r.pkg.Entries)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for _, pub := range r.pd.pubs[1:] {
 			if err := st.AddPublication(ctx, id, pub); err != nil {
-				return nil, err
+				return err
 			}
 		}
 		rep.Downloaded++
 		rep.FilesIndexed += len(r.pkg.Entries)
-		fmt.Fprintf(o.Log, "[%d/%d] %s %s (%s, %.1f MB, %d files)\n", done, len(todo), meta.Name, meta.Version,
+		fmt.Fprintf(o.Log, "%s %s (%s, %.1f MB, %d files)\n", meta.Name, meta.Version,
 			meta.Arch, float64(r.bytes)/1e6, len(r.pkg.Entries))
+		return nil
+	}
+
+	done := 0
+	var failed []*pubDeb
+	for r := range results {
+		done++
+		s := r.pd.stanza
+		rep.Bytes += r.bytes
+		fmt.Fprintf(o.Log, "[%d/%d] ", done, len(todo))
+		if r.err != nil {
+			failed = append(failed, r.pd)
+			fmt.Fprintf(o.Log, "FAIL %s %s: %v (will retry)\n", s.Package, s.Version, r.err)
+			continue
+		}
+		if err := save(r); err != nil {
+			return nil, err
+		}
+	}
+
+	// Second chance: outages are often brief, so retry failures one at a
+	// time after everything else has finished.
+	if len(failed) > 0 && ctx.Err() == nil {
+		fmt.Fprintf(o.Log, "retrying %d failed debs\n", len(failed))
+		for i, pd := range failed {
+			s := pd.stanza
+			pkg, n, err := fetch(ctx, repo, s)
+			rep.Bytes += n
+			fmt.Fprintf(o.Log, "[retry %d/%d] ", i+1, len(failed))
+			if err != nil {
+				rep.Failed = append(rep.Failed, fmt.Sprintf("%s %s: %v", s.Package, s.Version, err))
+				fmt.Fprintf(o.Log, "FAIL %s %s: %v\n", s.Package, s.Version, err)
+				continue
+			}
+			if err := save(result{pd: pd, pkg: pkg, bytes: n}); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return rep, err
 	}
+
+	// Witness hashes the file a symlink points to, but Contents credits the
+	// path to the package that owns the link (/usr/bin/python3 is in
+	// python3-minimal; the python3.12 binary it points to is in
+	// python3.12-minimal). Follow links to their targets and ingest those
+	// packages too.
+	if !o.All && o.followDepth < maxFollow {
+		more, err := unresolvedLinkTargets(ctx, st, o.Targets)
+		if err != nil {
+			return nil, err
+		}
+		if len(more) > 0 {
+			fmt.Fprintf(o.Log, "following %d symlinks to their targets\n", len(more))
+			sub := o
+			sub.Targets = more
+			sub.followDepth++
+			sr, err := Run(ctx, st, sub)
+			if err != nil {
+				return nil, err
+			}
+			rep.Wanted += sr.Wanted
+			rep.UniqueDebs += sr.UniqueDebs
+			rep.AlreadyHad += sr.AlreadyHad
+			rep.Downloaded += sr.Downloaded
+			rep.Bytes += sr.Bytes
+			rep.FilesIndexed += sr.FilesIndexed
+			rep.HistoryDebs += sr.HistoryDebs
+			rep.Failed = append(rep.Failed, sr.Failed...)
+		}
+	}
 	rep.Duration = time.Since(start)
 	return rep, nil
+}
+
+// unresolvedLinkTargets returns the targets of symlinked target paths that
+// no indexed package ships as a real file yet.
+func unresolvedLinkTargets(ctx context.Context, st *store.Store, targets []string) ([]string, error) {
+	var variants []string
+	for _, t := range targets {
+		variants = append(variants, attest.Variants(t)...)
+	}
+	links, err := st.SymlinkTargets(ctx, variants)
+	if err != nil || len(links) == 0 {
+		return nil, err
+	}
+	var check []string
+	for _, dst := range links {
+		check = append(check, attest.Variants(dst)...)
+	}
+	shipped, err := st.ShippedFiles(ctx, check)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, dst := range links {
+		found := false
+		for _, v := range attest.Variants(dst) {
+			if shipped[v] {
+				found = true
+				break
+			}
+		}
+		if !found && !seen[dst] {
+			seen[dst] = true
+			out = append(out, dst)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // fetch streams one .deb: download → verify sha256 → parse → hash entries.

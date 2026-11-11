@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,10 +20,21 @@ import (
 // fakeRepo serves a minimal Ubuntu-style mirror with two pockets.
 type fakeRepo struct {
 	files map[string][]byte
+	mu    sync.Mutex
+	flaky map[string]int // path -> remaining requests to refuse
 }
 
 func (f *fakeRepo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	b, ok := f.files[strings.TrimPrefix(r.URL.Path, "/")]
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	f.mu.Lock()
+	if f.flaky[path] > 0 {
+		f.flaky[path]--
+		f.mu.Unlock()
+		http.Error(w, "flaky", http.StatusNotFound) // not retried by GetURL
+		return
+	}
+	f.mu.Unlock()
+	b, ok := f.files[path]
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -32,6 +44,7 @@ func (f *fakeRepo) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 type debSpec struct {
 	name, version, arch, file, body string
+	link                            string // if set, file is a symlink to this
 	tamper                          bool
 }
 
@@ -63,7 +76,7 @@ func buildDeb(t *testing.T, d debSpec) []byte {
 	return debtest.Build(t, debtest.Spec{
 		Control:     fmt.Sprintf("Package: %s\nVersion: %s\nArchitecture: %s\n", d.name, d.version, d.arch),
 		Compression: ".zst",
-		Files:       []debtest.File{{Path: "." + d.file, Body: d.body}},
+		Files:       []debtest.File{{Path: "." + d.file, Body: d.body, Link: d.link}},
 	})
 }
 
@@ -189,5 +202,58 @@ func TestRunWithLaunchpadHistory(t *testing.T) {
 
 	if _, err := Run(ctx, st, Options{All: true, History: &History{}}); err == nil {
 		t.Fatal("history with --all should be rejected")
+	}
+}
+
+func TestRunRetriesFailedDownloads(t *testing.T) {
+	repo := &fakeRepo{files: map[string][]byte{}}
+	repo.addSuite(t, "noble", []debSpec{{name: "libfoo1", version: "1.0", arch: "arm64", file: "/usr/lib/libfoo.so.1", body: "foo"}})
+	repo.flaky = map[string]int{"pool/main/libfoo1/libfoo1_1.0_arm64.deb": 1}
+	srv := httptest.NewServer(repo)
+	defer srv.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "idx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rep, err := Run(context.Background(), st, Options{
+		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
+		Arch: "arm64", Targets: []string{"/usr/lib/libfoo.so.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Downloaded != 1 || len(rep.Failed) != 0 {
+		t.Fatalf("first failure should be retried and succeed: %+v", rep)
+	}
+}
+
+func TestRunFollowsSymlinks(t *testing.T) {
+	repo := &fakeRepo{files: map[string][]byte{}}
+	repo.addSuite(t, "noble", []debSpec{
+		{name: "python3-minimal", version: "3.12.3-0ubuntu2", arch: "arm64", file: "/usr/bin/python3", link: "python3.12"},
+		{name: "python3.12-minimal", version: "3.12.3-1ubuntu0.8", arch: "arm64", file: "/usr/bin/python3.12", body: "python ELF"},
+		{name: "unrelated", version: "1", arch: "arm64", file: "/usr/bin/other", body: "x"},
+	})
+	srv := httptest.NewServer(repo)
+	defer srv.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "idx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rep, err := Run(context.Background(), st, Options{
+		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
+		Arch: "arm64", Targets: []string{"/usr/bin/python3"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Downloaded != 2 {
+		t.Fatalf("want the link owner and the target owner, got %+v", rep)
+	}
+	res, err := st.Lookup(context.Background(), []string{debtest.SHA256("python ELF")}, store.Filter{}, 0)
+	if err != nil || res[debtest.SHA256("python ELF")] == nil {
+		t.Fatalf("python3.12 binary not indexed: %v %v", res, err)
 	}
 }

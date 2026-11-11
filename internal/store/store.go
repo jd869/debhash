@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	pathpkg "path"
 	"sort"
 	"strings"
 	"time"
@@ -353,6 +354,70 @@ func (s *Store) LookupPaths(ctx context.Context, paths []string, f Filter) (map[
 		rows.Close()
 	}
 	return out, nil
+}
+
+// SymlinkTargets returns, for each of paths that some indexed package ships
+// as a symlink, the absolute path the link points to.
+func (s *Store) SymlinkTargets(ctx context.Context, paths []string) (map[string]string, error) {
+	out := map[string]string{}
+	err := s.inPaths(ctx, `SELECT DISTINCT path, link_target FROM files WHERE kind = 'symlink' AND path IN (%s)`, paths,
+		func(rows *sql.Rows) error {
+			var p, target string
+			if err := rows.Scan(&p, &target); err != nil {
+				return err
+			}
+			if !strings.HasPrefix(target, "/") {
+				target = pathpkg.Join(pathpkg.Dir(p), target)
+			}
+			out[p] = pathpkg.Clean(target)
+			return nil
+		})
+	return out, err
+}
+
+// ShippedFiles reports which of paths some indexed package ships as a
+// regular file (or hardlink).
+func (s *Store) ShippedFiles(ctx context.Context, paths []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	err := s.inPaths(ctx, `SELECT DISTINCT path FROM files WHERE kind != 'symlink' AND path IN (%s)`, paths,
+		func(rows *sql.Rows) error {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				return err
+			}
+			out[p] = true
+			return nil
+		})
+	return out, err
+}
+
+// inPaths runs query (with one %s for the IN list) over paths in batches.
+func (s *Store) inPaths(ctx context.Context, query string, paths []string, scan func(*sql.Rows) error) error {
+	const batch = 500
+	for start := 0; start < len(paths); start += batch {
+		chunk := paths[start:min(start+batch, len(paths))]
+		args := make([]any, len(chunk))
+		ph := make([]string, len(chunk))
+		for i, p := range chunk {
+			args[i], ph[i] = p, "?"
+		}
+		rows, err := s.db.QueryContext(ctx, fmt.Sprintf(query, strings.Join(ph, ",")), args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			if err := scan(rows); err != nil {
+				rows.Close()
+				return err
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // apply appends the filter's WHERE clauses (the query must already have one).
