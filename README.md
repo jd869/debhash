@@ -12,7 +12,25 @@ attribute system files such as `/lib/aarch64-linux-gnu/libc.so.6`, because their
 carry no version. Their content hash can.
 
 > **Status: proof of concept.** It indexes Ubuntu noble arm64 for the files in one real
-> attestation. The schema, CLI and API are expected to change.
+> attestation (results below). The schema, CLI and API are expected to change.
+
+## Results on a real attestation
+
+[`test/orjson_witness.json`](https://github.com/SBOMit/sbomit/blob/master/test/orjson_witness.json) from sbomit: a witness attestation of an orjson build on a GitHub Ubuntu 24.04 arm64 runner, made on 2025-12-10. It is reproduced by the [`backfill`](.github/workflows/backfill.yml) workflow.
+
+| | Current mirror only | + versions live 2025-09-01 to 2025-12-10 (Launchpad) |
+|---|---|---|
+| Hashable system files matched | 151 / 198 (76%) | **192 / 198 (97%)** |
+| Shared libraries matched | 18 / 54 | **54 / 54** |
+| Packages identified | 31 | **48** |
+| …with an exact version | 23 | **45** |
+| `.pyc` attributed via their `.py` source | 578 / 578 | 578 / 578 |
+| Distro from the `/etc/os-release` hash | no | **Ubuntu 24.04.3** (`base-files 13ubuntu10.3`) |
+
+- **All 6 remaining misses are files created on the machine**, which no package ships: `/etc/hosts`, `/etc/resolv.conf`, `/etc/ld.so.cache`, `/etc/localtime`, the CA bundle and its `cert.pem` link.
+- **3 packages keep more than one candidate version:** `python3-pip`, `python3-setuptools` and `linux-libc-dev`. Their files are pure Python or headers that are identical across those versions, and no rebuilt binary is attested to tell the versions apart.
+- **Why history matters:** without it, rebuilt binaries (`libc.so.6`, `libssl.so.3`, `python3.12`) don't match, because the live mirror no longer carries the point release the runner had installed.
+- **Source-version propagation:** `libc.so.6` pins `libc6 2.39-0ubuntu8.6`, which also pins `libc-bin` and `libc6-dev` (93 headers that are identical across versions). Likewise, `libssl3t64` pins `openssl`.
 
 ## How it works
 
