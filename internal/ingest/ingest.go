@@ -324,7 +324,7 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 	// python3.12-minimal). Follow links to their targets and ingest those
 	// packages too.
 	if !o.All && o.followDepth < maxFollow {
-		more, err := unresolvedLinkTargets(ctx, st, o.Targets)
+		more, err := linkTargetsToFollow(ctx, st, o.Targets, wanted)
 		if err != nil {
 			return nil, err
 		}
@@ -351,9 +351,12 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 	return rep, nil
 }
 
-// unresolvedLinkTargets returns the targets of symlinked target paths that
-// no indexed package ships as a real file yet.
-func unresolvedLinkTargets(ctx context.Context, st *store.Store, targets []string) ([]string, error) {
+// linkTargetsToFollow returns the targets of symlinked target paths whose
+// real file is not shipped by any package this run already selected. That
+// covers both "not indexed at all" and "indexed, but only in versions from an
+// earlier run": with history enabled the owner's historical versions must be
+// fetched too, even if a current version is already in the index.
+func linkTargetsToFollow(ctx context.Context, st *store.Store, targets []string, wanted map[string]bool) ([]string, error) {
 	var variants []string
 	for _, t := range targets {
 		variants = append(variants, attest.Variants(t)...)
@@ -366,21 +369,26 @@ func unresolvedLinkTargets(ctx context.Context, st *store.Store, targets []strin
 	for _, dst := range links {
 		check = append(check, attest.Variants(dst)...)
 	}
-	shipped, err := st.ShippedFiles(ctx, check)
+	owners, err := st.FileOwners(ctx, check)
 	if err != nil {
 		return nil, err
+	}
+	isTarget := map[string]bool{}
+	for _, t := range targets {
+		isTarget[t] = true
 	}
 	seen := map[string]bool{}
 	var out []string
 	for _, dst := range links {
-		found := false
+		covered := false
 		for _, v := range attest.Variants(dst) {
-			if shipped[v] {
-				found = true
-				break
+			for _, name := range owners[v] {
+				if wanted[name] {
+					covered = true
+				}
 			}
 		}
-		if !found && !seen[dst] {
+		if !covered && !isTarget[dst] && !seen[dst] {
 			seen[dst] = true
 			out = append(out, dst)
 		}

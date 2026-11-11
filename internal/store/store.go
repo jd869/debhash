@@ -375,17 +375,18 @@ func (s *Store) SymlinkTargets(ctx context.Context, paths []string) (map[string]
 	return out, err
 }
 
-// ShippedFiles reports which of paths some indexed package ships as a
-// regular file (or hardlink).
-func (s *Store) ShippedFiles(ctx context.Context, paths []string) (map[string]bool, error) {
-	out := map[string]bool{}
-	err := s.inPaths(ctx, `SELECT DISTINCT path FROM files WHERE kind != 'symlink' AND path IN (%s)`, paths,
+// FileOwners returns, for each of paths that some indexed package ships as a
+// regular file (or hardlink), the names of those packages.
+func (s *Store) FileOwners(ctx context.Context, paths []string) (map[string][]string, error) {
+	out := map[string][]string{}
+	err := s.inPaths(ctx, `SELECT DISTINCT f.path, p.name FROM files f JOIN packages p ON p.id = f.package_id
+		WHERE f.kind != 'symlink' AND f.path IN (%s)`, paths,
 		func(rows *sql.Rows) error {
-			var p string
-			if err := rows.Scan(&p); err != nil {
+			var p, name string
+			if err := rows.Scan(&p, &name); err != nil {
 				return err
 			}
-			out[p] = true
+			out[p] = append(out[p], name)
 			return nil
 		})
 	return out, err

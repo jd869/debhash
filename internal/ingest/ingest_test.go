@@ -257,3 +257,47 @@ func TestRunFollowsSymlinks(t *testing.T) {
 		t.Fatalf("python3.12 binary not indexed: %v %v", res, err)
 	}
 }
+
+// Regression: a first run without history already indexed the current
+// python3.12-minimal (via the python3 symlink). A later history run must
+// still follow the link and fetch the historical version the build used.
+func TestHistoryRunFollowsSymlinkAlreadyIndexed(t *testing.T) {
+	link := debSpec{name: "python3-minimal", version: "3.12.3-0ubuntu2", arch: "arm64", file: "/usr/bin/python3", link: "python3.12"}
+	cur := debSpec{name: "python3.12-minimal", version: "3.12.3-1ubuntu0.17", arch: "arm64", file: "/usr/bin/python3.12", body: "python 0.17"}
+	old := debSpec{name: "python3.12-minimal", version: "3.12.3-1ubuntu0.8", arch: "arm64", file: "/usr/bin/python3.12", body: "python 0.8"}
+
+	repo := &fakeRepo{files: map[string][]byte{}}
+	repo.addSuite(t, "noble", []debSpec{link, cur})
+	srv := httptest.NewServer(repo)
+	defer srv.Close()
+
+	lp := lptest.New(t)
+	rawLink, rawOld := buildDeb(t, link), buildDeb(t, old)
+	lp.Add(lptest.Pub{Name: "python3-minimal", Version: link.version, Pocket: "Release", Published: "2024-04-20T00:00:00+00:00", SHA256: debtest.SHA256Bytes(rawLink), Body: rawLink})
+	lp.Add(lptest.Pub{Name: "python3.12-minimal", Version: old.version, Pocket: "Updates", Published: "2025-10-01T00:00:00+00:00", Superseded: "2025-12-20T00:00:00+00:00", SHA256: debtest.SHA256Bytes(rawOld), Body: rawOld})
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "idx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	base := Options{
+		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
+		Arch: "arm64", Targets: []string{"/usr/bin/python3"},
+	}
+	if _, err := Run(ctx, st, base); err != nil { // step 1: current versions
+		t.Fatal(err)
+	}
+	after, _ := time.Parse("2006-01-02", "2025-09-01")
+	before, _ := time.Parse("2006-01-02", "2025-12-10")
+	withHistory := base
+	withHistory.History = &History{Launchpad: &launchpad.Client{API: lp.URL()}, After: after, Before: before}
+	if _, err := Run(ctx, st, withHistory); err != nil { // step 2: history
+		t.Fatal(err)
+	}
+	res, err := st.Lookup(ctx, []string{debtest.SHA256("python 0.8")}, store.Filter{}, 0)
+	if err != nil || res[debtest.SHA256("python 0.8")] == nil {
+		t.Fatalf("historical python3.12-minimal behind the symlink was not fetched: %v %v", res, err)
+	}
+}
