@@ -1,15 +1,26 @@
 # Build the noble/arm64 index for sbomit's orjson fixture, including the
-# historical versions from snapshot.ubuntu.com, and publish the report.
+# historical versions live around its build date (from Launchpad, or from
+# snapshot.ubuntu.com), and publish a before/after report.
 # Run it from the Actions tab: "backfill" -> "Run workflow".
 name: backfill
 
 on:
   workflow_dispatch:
     inputs:
+      source:
+        description: where historical versions come from
+        type: choice
+        options: [launchpad, snapshot]
+        default: launchpad
+      after:
+        description: "launchpad: window start (YYYY-MM-DD)"
+        default: "2025-09-01"
+      before:
+        description: "launchpad: window end, the build date (YYYY-MM-DD)"
+        default: "2025-12-10"
       timestamps:
-        description: snapshot.ubuntu.com timestamps, space-separated (YYYYMMDDTHHMMSSZ)
+        description: "snapshot: snapshot.ubuntu.com timestamps, space-separated (YYYYMMDDTHHMMSSZ)"
         default: "20251101T000000Z 20251115T000000Z 20251201T000000Z 20251210T000000Z"
-        required: true
 
 permissions:
   contents: read
@@ -42,7 +53,21 @@ jobs:
           ./debhash report --db data/noble-arm64.db --attestation sbomit/test/orjson_witness.json \
             --suite noble --arch arm64 --misses 0 > data/report-before-backfill.txt
 
+      - name: Backfill from Launchpad
+        if: inputs.source == 'launchpad'
+        env:
+          AFTER: ${{ inputs.after }}
+          BEFORE: ${{ inputs.before }}
+        run: |
+          ./debhash ingest --db data/noble-arm64.db --suite noble --arch arm64 --workers 6 \
+            --paths-from sbomit/test/orjson_witness.json \
+            --history launchpad --history-after "$AFTER" --history-before "$BEFORE" 2>&1 | tee data/backfill.log
+          ./debhash report --db data/noble-arm64.db --attestation sbomit/test/orjson_witness.json \
+            --suite noble --arch arm64 --misses 0 > data/report-after-backfill.txt
+          ./debhash stats --db data/noble-arm64.db > data/stats.json
+
       - name: Backfill snapshots
+        if: inputs.source == 'snapshot'
         env:
           # Passed via env, not interpolated into the script, to avoid injection.
           TIMESTAMPS: ${{ inputs.timestamps }}

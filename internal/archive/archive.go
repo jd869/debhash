@@ -51,12 +51,21 @@ type Stanza struct {
 	Filename, SHA256                                      string
 	Size                                                  int64
 	Suite, Component                                      string
+	// URL, when set, is an absolute download location that overrides
+	// Filename (used for debs that come from Launchpad, not the mirror).
+	URL string
+	// Mirror records where the deb was published, for the publication row.
+	Mirror string
 }
 
 // Get fetches mirror/rel, retrying transient failures.
 func (r Repo) Get(ctx context.Context, rel string) (*http.Response, error) {
-	url := strings.TrimRight(r.Mirror, "/") + "/" + strings.TrimLeft(rel, "/")
-	client := r.Client
+	return GetURL(ctx, r.Client, strings.TrimRight(r.Mirror, "/")+"/"+strings.TrimLeft(rel, "/"))
+}
+
+// GetURL fetches an absolute URL, retrying network errors, 5xx and 429 with
+// backoff. Any other non-200 status is returned as an error immediately.
+func GetURL(ctx context.Context, client *http.Client, url string) (*http.Response, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -316,9 +325,15 @@ func ParseContentsLine(line string) (string, []string, bool) {
 	return path.Clean("/" + p), pkgs, len(pkgs) > 0
 }
 
-// OpenPool opens a pool file (a .deb) for streaming.
-func (r Repo) OpenPool(ctx context.Context, filename string) (io.ReadCloser, error) {
-	resp, err := r.Get(ctx, filename)
+// OpenPool opens a .deb for streaming: s.URL if set, else the pool path.
+func (r Repo) OpenPool(ctx context.Context, s Stanza) (io.ReadCloser, error) {
+	var resp *http.Response
+	var err error
+	if s.URL != "" {
+		resp, err = GetURL(ctx, r.Client, s.URL)
+	} else {
+		resp, err = r.Get(ctx, s.Filename)
+	}
 	if err != nil {
 		return nil, err
 	}

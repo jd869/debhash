@@ -8,8 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jd869/debhash/internal/debtest"
+	"github.com/jd869/debhash/internal/launchpad"
+	"github.com/jd869/debhash/internal/launchpad/lptest"
 	"github.com/jd869/debhash/internal/store"
 )
 
@@ -36,11 +39,7 @@ type debSpec struct {
 func (f *fakeRepo) addSuite(t *testing.T, suite string, debs []debSpec) {
 	var packages, contents strings.Builder
 	for _, d := range debs {
-		raw := debtest.Build(t, debtest.Spec{
-			Control:     fmt.Sprintf("Package: %s\nVersion: %s\nArchitecture: %s\n", d.name, d.version, d.arch),
-			Compression: ".zst",
-			Files:       []debtest.File{{Path: "." + d.file, Body: d.body}},
-		})
+		raw := buildDeb(t, d)
 		pool := fmt.Sprintf("pool/main/%s/%s_%s_%s.deb", d.name, d.name, d.version, d.arch)
 		sum := debtest.SHA256Bytes(raw)
 		if d.tamper {
@@ -58,6 +57,14 @@ func (f *fakeRepo) addSuite(t *testing.T, suite string, debs []debSpec) {
 	f.files["dists/"+suite+"/Contents-arm64.gz"] = ct
 	f.files["dists/"+suite+"/Release"] = []byte(fmt.Sprintf("Origin: Ubuntu\nVersion: 24.04\nSuite: %s\nSHA256:\n %s %d main/binary-arm64/Packages.gz\n %s %d Contents-arm64.gz\n",
 		suite, debtest.SHA256Bytes(pk), len(pk), debtest.SHA256Bytes(ct), len(ct)))
+}
+
+func buildDeb(t *testing.T, d debSpec) []byte {
+	return debtest.Build(t, debtest.Spec{
+		Control:     fmt.Sprintf("Package: %s\nVersion: %s\nArchitecture: %s\n", d.name, d.version, d.arch),
+		Compression: ".zst",
+		Files:       []debtest.File{{Path: "." + d.file, Body: d.body}},
+	})
 }
 
 func TestRunTargetedTwoPockets(t *testing.T) {
@@ -128,5 +135,59 @@ func TestRunRequiresSelection(t *testing.T) {
 func TestDistroVersion(t *testing.T) {
 	if distroVersion("debian", "12.7") != "12" || distroVersion("ubuntu", "24.04") != "24.04" {
 		t.Fatal("distroVersion")
+	}
+}
+
+func TestRunWithLaunchpadHistory(t *testing.T) {
+	v10 := debSpec{name: "libfoo1", version: "1.0", arch: "arm64", file: "/usr/lib/aarch64-linux-gnu/libfoo.so.1", body: "foo v1.0"}
+	v11 := debSpec{name: "libfoo1", version: "1.1", arch: "arm64", file: "/usr/lib/aarch64-linux-gnu/libfoo.so.1", body: "foo v1.1"}
+	v12 := debSpec{name: "libfoo1", version: "1.2", arch: "arm64", file: "/usr/lib/aarch64-linux-gnu/libfoo.so.1", body: "foo v1.2"}
+
+	// The mirror only has the release version and today's update.
+	repo := &fakeRepo{files: map[string][]byte{}}
+	repo.addSuite(t, "noble", []debSpec{v10})
+	repo.addSuite(t, "noble-updates", []debSpec{v12})
+	srv := httptest.NewServer(repo)
+	defer srv.Close()
+
+	// Launchpad also knows 1.1, which was current at build time.
+	lp := lptest.New(t)
+	raw10, raw11, raw12 := buildDeb(t, v10), buildDeb(t, v11), buildDeb(t, v12)
+	lp.Add(lptest.Pub{Name: "libfoo1", Version: "1.0", Pocket: "Release", Published: "2024-04-20T00:00:00+00:00", Superseded: "2025-10-01T00:00:00+00:00", SHA256: debtest.SHA256Bytes(raw10), Body: raw10})
+	lp.Add(lptest.Pub{Name: "libfoo1", Version: "1.1", Pocket: "Updates", Published: "2025-10-01T00:00:00+00:00", Superseded: "2025-12-20T00:00:00+00:00", SHA256: debtest.SHA256Bytes(raw11), Body: raw11})
+	lp.Add(lptest.Pub{Name: "libfoo1", Version: "1.2", Pocket: "Updates", Published: "2025-12-20T00:00:00+00:00", SHA256: debtest.SHA256Bytes(raw12), Body: raw12})
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "idx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	after, _ := time.Parse("2006-01-02", "2025-09-01")
+	before, _ := time.Parse("2006-01-02", "2025-12-10")
+	ctx := context.Background()
+	rep, err := Run(ctx, st, Options{
+		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release", "updates"},
+		Components: []string{"main"}, Arch: "arm64", Workers: 2,
+		Targets: []string{"/usr/lib/aarch64-linux-gnu/libfoo.so.1"},
+		History: &History{Launchpad: &launchpad.Client{API: lp.URL()}, After: after, Before: before},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mirror: 1.0 + 1.2. Launchpad window: 1.0 (same deb, deduped) + 1.1.
+	if rep.HistoryDebs != 2 || rep.UniqueDebs != 3 || rep.Downloaded != 3 || len(rep.Failed) != 0 {
+		t.Fatalf("report = %+v", rep)
+	}
+	res, err := st.Lookup(ctx, []string{debtest.SHA256("foo v1.1")}, store.Filter{Suite: "noble", Arch: "arm64"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := res[debtest.SHA256("foo v1.1")]
+	if r == nil || r.Candidates[0].Version != "1.1" || r.Candidates[0].Suite != "noble-updates" || r.Candidates[0].DistroVersion != "24.04" {
+		t.Fatalf("historical version not indexed correctly: %+v", r)
+	}
+
+	if _, err := Run(ctx, st, Options{All: true, History: &History{}}); err == nil {
+		t.Fatal("history with --all should be rejected")
 	}
 }

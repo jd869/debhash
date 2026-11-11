@@ -1,6 +1,7 @@
 // Command debhash builds and serves a file-hash → Debian package index.
 //
 //	debhash ingest  --db idx.db --mirror URL --suite noble --arch arm64 [--paths-from att.json | --all]
+//	                [--history launchpad --history-after 2025-09-01 --history-before 2025-12-10]
 //	debhash report  --db idx.db --attestation att.json [--suite noble --arch arm64] [--json]
 //	debhash lookup  --db idx.db <sha256>...
 //	debhash inspect file.deb
@@ -25,6 +26,7 @@ import (
 	"github.com/jd869/debhash/internal/attest"
 	"github.com/jd869/debhash/internal/deb"
 	"github.com/jd869/debhash/internal/ingest"
+	"github.com/jd869/debhash/internal/launchpad"
 	"github.com/jd869/debhash/internal/report"
 	"github.com/jd869/debhash/internal/server"
 	"github.com/jd869/debhash/internal/store"
@@ -98,6 +100,9 @@ func cmdIngest(ctx context.Context, args []string) error {
 	pathsFrom := fs.String("paths-from", "", "witness attestation: only ingest packages shipping its files")
 	all := fs.Bool("all", false, "ingest every package in the selected pockets/components")
 	workers := fs.Int("workers", 4, "parallel downloads")
+	history := fs.String("history", "", `also ingest historical versions; "launchpad" (Ubuntu only)`)
+	after := fs.String("history-after", "", "history window start, YYYY-MM-DD")
+	before := fs.String("history-before", "", "history window end, YYYY-MM-DD (e.g. the build date)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -105,6 +110,28 @@ func cmdIngest(ctx context.Context, args []string) error {
 		Mirror: *mirror, Distro: *distro, Suite: *suite, Pockets: splitList(*pockets),
 		Components: splitList(*components), Arch: *arch, All: *all, Workers: *workers,
 		Client: &http.Client{Timeout: 10 * time.Minute}, Log: os.Stderr,
+	}
+	switch *history {
+	case "":
+	case "launchpad":
+		a, err := time.Parse("2006-01-02", *after)
+		if err != nil {
+			return fmt.Errorf("--history-after: want YYYY-MM-DD: %w", err)
+		}
+		b, err := time.Parse("2006-01-02", *before)
+		if err != nil {
+			return fmt.Errorf("--history-before: want YYYY-MM-DD: %w", err)
+		}
+		if b.Before(a) {
+			return errors.New("--history-before is earlier than --history-after")
+		}
+		opts.History = &ingest.History{
+			Launchpad: &launchpad.Client{HTTP: &http.Client{Timeout: 2 * time.Minute}},
+			After:     a,
+			Before:    b.Add(24*time.Hour - time.Second), // inclusive end of day
+		}
+	default:
+		return fmt.Errorf("--history %q: only \"launchpad\" is supported", *history)
 	}
 	if *pathsFrom != "" && !*all {
 		files, err := attest.ReadFile(*pathsFrom)

@@ -32,7 +32,10 @@ SQLite: packages (one row per .deb) · publications (suite/pocket/mirror) · fil
 - **Targeted ingest** (`--paths-from`) uses the `Contents-<arch>` index (path → package, the same data as `apt-file`) to fetch only the packages that ship a file in the attestation.
   - Merged-`/usr` spellings (`/lib/…` vs `/usr/lib/…`) are both tried.
   - For a generated `__pycache__/*.pyc`, it fetches the package owning the `.py` source.
-- **History:** the live mirror only has the newest version of each package. Pointing `--mirror` at `https://snapshot.ubuntu.com/ubuntu-ports/<timestamp>` ingests the archive as it was then. Re-runs only download debs that aren't already indexed.
+- **History:** the live mirror only has the newest version of each package, but a build installs whatever was current on its build date. Two sources fill the gap:
+  - `--history launchpad --history-after 2025-09-01 --history-before 2025-12-10` asks Launchpad, where Ubuntu builds every package, for each targeted package's versions that were live in that window, then downloads them with their published sha256.
+  - Pointing `--mirror` at `https://snapshot.ubuntu.com/ubuntu-ports/<timestamp>` ingests the archive as it was at that moment (`scripts/backfill-snapshots.sh`).
+  - Either way, re-runs only download debs that aren't already indexed.
 
 ## Quick start
 
@@ -43,8 +46,10 @@ go build -o debhash ./cmd/debhash
 ./debhash ingest --db data/noble-arm64.db --suite noble --arch arm64 \
   --paths-from ../sbomit/test/orjson_witness.json
 
-# Add the versions that were current around the build date.
-scripts/backfill-snapshots.sh ../sbomit/test/orjson_witness.json data/noble-arm64.db
+# Add the versions that were live around the build date (2025-12-10).
+./debhash ingest --db data/noble-arm64.db --suite noble --arch arm64 \
+  --paths-from ../sbomit/test/orjson_witness.json \
+  --history launchpad --history-after 2025-09-01 --history-before 2025-12-10
 
 # How much of the attestation does the index attribute?
 ./debhash report --db data/noble-arm64.db --attestation ../sbomit/test/orjson_witness.json \

@@ -27,6 +27,7 @@ import (
 	"github.com/jd869/debhash/internal/archive"
 	"github.com/jd869/debhash/internal/attest"
 	"github.com/jd869/debhash/internal/deb"
+	"github.com/jd869/debhash/internal/launchpad"
 	"github.com/jd869/debhash/internal/store"
 )
 
@@ -43,6 +44,17 @@ type Options struct {
 	Workers    int
 	Client     *http.Client
 	Log        io.Writer
+	// History, when set, also ingests every version of the targeted packages
+	// that Launchpad says was live in [After, Before]: the versions a build
+	// at that time could have installed, which the live mirror no longer has.
+	History *History
+}
+
+// History selects historical versions from Launchpad.
+type History struct {
+	Launchpad *launchpad.Client
+	After     time.Time
+	Before    time.Time
 }
 
 // Report summarises a run.
@@ -58,6 +70,7 @@ type Report struct {
 	Bytes        int64    // bytes downloaded
 	FilesIndexed int      // file entries written
 	Failed       []string // debs that failed (with reason)
+	HistoryDebs  int      // publications added from Launchpad history
 	Duration     time.Duration
 }
 
@@ -78,6 +91,9 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 	if !o.All && len(o.Targets) == 0 {
 		return nil, fmt.Errorf("nothing to ingest: pass target paths or select all")
 	}
+	if o.History != nil && o.All {
+		return nil, fmt.Errorf("history needs targeted mode: full-suite history would download every version of everything")
+	}
 	repo := archive.Repo{Mirror: o.Mirror, Client: o.Client}
 	rep := &Report{}
 
@@ -85,6 +101,7 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 	var releases []*archive.Release
 	var all []archive.Stanza
 	pubFor := map[string]store.Publication{} // suite/component -> publication
+	var distro, distroVer string
 	for _, pocket := range o.Pockets {
 		suite := o.Suite
 		if pocket != "" && pocket != "release" {
@@ -95,10 +112,11 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 			return nil, fmt.Errorf("release %s: %w", suite, err)
 		}
 		releases = append(releases, rel)
-		distro := o.Distro
+		distro = o.Distro
 		if distro == "" {
 			distro = strings.ToLower(rel.Origin)
 		}
+		distroVer = distroVersion(distro, rel.Version)
 		for _, comp := range o.Components {
 			stanzas, err := repo.Packages(ctx, rel, comp, o.Arch)
 			if err != nil {
@@ -107,7 +125,7 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 			rep.Indexes++
 			fmt.Fprintf(o.Log, "index %s/%s/binary-%s: %d packages\n", suite, comp, o.Arch, len(stanzas))
 			pubFor[suite+"/"+comp] = store.Publication{
-				Distro: distro, DistroVersion: distroVersion(distro, rel.Version),
+				Distro: distro, DistroVersion: distroVer,
 				Suite: suite, Component: comp, Mirror: strings.TrimRight(o.Mirror, "/"),
 			}
 			all = append(all, stanzas...)
@@ -124,6 +142,22 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 			return nil, err
 		}
 		rep.Wanted = len(wanted)
+	}
+
+	// 2b. Historical versions of the wanted packages.
+	if o.History != nil {
+		hist, err := history(ctx, o, distro, wanted)
+		if err != nil {
+			return nil, err
+		}
+		rep.HistoryDebs = len(hist)
+		all = append(all, hist...)
+	}
+	pubOf := func(s archive.Stanza) store.Publication {
+		if p, ok := pubFor[s.Suite+"/"+s.Component]; ok && s.Mirror == "" {
+			return p
+		}
+		return store.Publication{Distro: distro, DistroVersion: distroVer, Suite: s.Suite, Component: s.Component, Mirror: s.Mirror}
 	}
 
 	// 3. Unique debs, each with every place it is published.
@@ -143,7 +177,7 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 			byDeb[key] = pd
 			order = append(order, key)
 		}
-		pd.pubs = append(pd.pubs, pubFor[s.Suite+"/"+s.Component])
+		pd.pubs = append(pd.pubs, pubOf(s))
 	}
 	if o.All {
 		rep.Wanted = len(order)
@@ -223,6 +257,9 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 			DebSHA256: s.SHA256, Name: s.Package, Version: s.Version, Arch: s.Architecture,
 			Source: s.Source, SourceVersion: s.SourceVersion, Filename: s.Filename, Size: r.bytes,
 		}
+		if meta.Filename == "" {
+			meta.Filename = s.URL
+		}
 		// Control is authoritative; Packages should agree, but trust the deb.
 		if c := r.pkg.Control; c.Package != "" {
 			meta.Name, meta.Version, meta.Arch = c.Package, c.Version, c.Architecture
@@ -251,7 +288,7 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 
 // fetch streams one .deb: download → verify sha256 → parse → hash entries.
 func fetch(ctx context.Context, repo archive.Repo, s archive.Stanza) (*deb.Package, int64, error) {
-	body, err := repo.OpenPool(ctx, s.Filename)
+	body, err := repo.OpenPool(ctx, s)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -304,6 +341,82 @@ func targetPackages(ctx context.Context, repo archive.Repo, releases []*archive.
 	}
 	rep.FoundPaths = len(found)
 	return names, nil
+}
+
+// history asks Launchpad for every version of each wanted package that was
+// live in the window, as stanzas that download from Launchpad.
+func history(ctx context.Context, o Options, distro string, wanted map[string]bool) ([]archive.Stanza, error) {
+	names := make([]string, 0, len(wanted))
+	for n := range wanted {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	fmt.Fprintf(o.Log, "launchpad: versions of %d packages live between %s and %s\n",
+		len(names), o.History.After.Format("2006-01-02"), o.History.Before.Format("2006-01-02"))
+
+	type res struct {
+		name string
+		bins []launchpad.Binary
+		err  error
+	}
+	jobs := make(chan string)
+	results := make(chan res)
+	var wg sync.WaitGroup
+	for i := 0; i < min(o.Workers, 4); i++ { // be polite to the Launchpad API
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := range jobs {
+				bins, err := o.History.Launchpad.Window(ctx, distro, o.Suite, o.Arch, n, o.History.After, o.History.Before)
+				select {
+				case results <- res{n, bins, err}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, n := range names {
+			select {
+			case jobs <- n:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() { wg.Wait(); close(results) }()
+
+	var out []archive.Stanza
+	var errs []string
+	for r := range results {
+		if r.err != nil {
+			// One package failing should not lose the rest.
+			errs = append(errs, fmt.Sprintf("%s: %v", r.name, r.err))
+			fmt.Fprintf(o.Log, "launchpad %s: %v\n", r.name, r.err)
+			continue
+		}
+		versions := map[string]bool{}
+		for _, b := range r.bins {
+			versions[b.Version] = true
+			out = append(out, archive.Stanza{
+				Package: b.Name, Version: b.Version, Architecture: b.Arch,
+				Source: b.Source, SourceVersion: b.SourceVersion,
+				SHA256: b.SHA256, Size: b.Size, URL: b.URL,
+				Suite: launchpad.Suite(o.Suite, b.Pocket), Component: b.Component,
+				Mirror: "https://launchpad.net",
+			})
+		}
+		fmt.Fprintf(o.Log, "launchpad %s: %d versions in window\n", r.name, len(versions))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(errs) == len(names) && len(names) > 0 {
+		return nil, fmt.Errorf("launchpad: every lookup failed (first: %s)", errs[0])
+	}
+	return out, nil
 }
 
 // distroVersion normalises the Release Version field to what goes in a PURL
