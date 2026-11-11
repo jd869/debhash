@@ -26,10 +26,23 @@ ARCH=${ARCH:-arm64}
 case "$ARCH" in amd64|i386) BASE=https://snapshot.ubuntu.com/ubuntu ;; *) BASE=https://snapshot.ubuntu.com/ubuntu-ports ;; esac
 
 go build -o debhash ./cmd/debhash
+failed=()
 for ts in "${TIMESTAMPS[@]}"; do
+  if ! [[ "$ts" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+    echo "skipping invalid timestamp '$ts' (want YYYYMMDDTHHMMSSZ)" >&2
+    failed+=("$ts")
+    continue
+  fi
   echo "=== snapshot $ts"
-  ./debhash ingest --db "$DB" --mirror "$BASE/$ts" --suite "$SUITE" --arch "$ARCH" \
-    --pockets updates,security --components main,universe --workers 6 --paths-from "$ATT"
+  # One unreachable snapshot should not lose the others.
+  if ! ./debhash ingest --db "$DB" --mirror "$BASE/$ts" --suite "$SUITE" --arch "$ARCH" \
+    --pockets updates,security --components main,universe --workers 6 --paths-from "$ATT"; then
+    echo "snapshot $ts failed; continuing" >&2
+    failed+=("$ts")
+  fi
 done
 echo
+if [ ${#failed[@]} -gt 0 ]; then
+  echo "failed snapshots: ${failed[*]}" >&2
+fi
 ./debhash report --db "$DB" --attestation "$ATT" --suite "$SUITE" --arch "$ARCH"

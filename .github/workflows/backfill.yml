@@ -1,0 +1,70 @@
+# Build the noble/arm64 index for sbomit's orjson fixture, including the
+# historical versions from snapshot.ubuntu.com, and publish the report.
+# Run it from the Actions tab: "backfill" -> "Run workflow".
+name: backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      timestamps:
+        description: snapshot.ubuntu.com timestamps, space-separated (YYYYMMDDTHHMMSSZ)
+        default: "20251101T000000Z 20251115T000000Z 20251201T000000Z 20251210T000000Z"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the sbomit fixture
+        uses: actions/checkout@v4
+        with:
+          repository: SBOMit/sbomit
+          path: sbomit
+          sparse-checkout: test/orjson_witness.json
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Ingest current noble pockets
+        run: |
+          mkdir -p data
+          go build -o debhash ./cmd/debhash
+          ./debhash ingest --db data/noble-arm64.db --suite noble --arch arm64 \
+            --workers 6 --paths-from sbomit/test/orjson_witness.json 2>&1 | tee data/ingest-current.log
+          ./debhash report --db data/noble-arm64.db --attestation sbomit/test/orjson_witness.json \
+            --suite noble --arch arm64 --misses 0 > data/report-before-backfill.txt
+
+      - name: Backfill snapshots
+        env:
+          # Passed via env, not interpolated into the script, to avoid injection.
+          TIMESTAMPS: ${{ inputs.timestamps }}
+        run: |
+          # shellcheck disable=SC2086 # word-splitting the list is intended
+          scripts/backfill-snapshots.sh sbomit/test/orjson_witness.json data/noble-arm64.db $TIMESTAMPS \
+            2>&1 | tee data/backfill.log
+          ./debhash report --db data/noble-arm64.db --attestation sbomit/test/orjson_witness.json \
+            --suite noble --arch arm64 --misses 0 > data/report-after-backfill.txt
+          ./debhash stats --db data/noble-arm64.db > data/stats.json
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Before backfill'; echo '```'; cat data/report-before-backfill.txt 2>/dev/null; echo '```'
+            echo '## After backfill';  echo '```'; cat data/report-after-backfill.txt 2>/dev/null; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: noble-arm64-index
+          path: data/
+          retention-days: 14
