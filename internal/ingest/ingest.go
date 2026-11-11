@@ -390,12 +390,12 @@ func history(ctx context.Context, o Options, distro string, wanted map[string]bo
 
 	var out []archive.Stanza
 	var errs []string
-	for r := range results {
+	var retry []string
+	collect := func(r res) {
 		if r.err != nil {
-			// One package failing should not lose the rest.
 			errs = append(errs, fmt.Sprintf("%s: %v", r.name, r.err))
 			fmt.Fprintf(o.Log, "launchpad %s: %v\n", r.name, r.err)
-			continue
+			return
 		}
 		versions := map[string]bool{}
 		for _, b := range r.bins {
@@ -410,11 +410,35 @@ func history(ctx context.Context, o Options, distro string, wanted map[string]bo
 		}
 		fmt.Fprintf(o.Log, "launchpad %s: %d versions in window\n", r.name, len(versions))
 	}
+	for r := range results {
+		if r.err != nil {
+			// One package failing should not lose the rest; try it again
+			// once the first pass is over (outages are often brief).
+			retry = append(retry, r.name)
+			fmt.Fprintf(o.Log, "launchpad %s: %v (will retry)\n", r.name, r.err)
+			continue
+		}
+		collect(r)
+	}
+	if len(retry) > 0 {
+		sort.Strings(retry)
+		fmt.Fprintf(o.Log, "launchpad: retrying %d packages\n", len(retry))
+		for _, n := range retry {
+			if ctx.Err() != nil {
+				break
+			}
+			bins, err := o.History.Launchpad.Window(ctx, distro, o.Suite, o.Arch, n, o.History.After, o.History.Before)
+			collect(res{n, bins, err})
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if len(errs) == len(names) && len(names) > 0 {
 		return nil, fmt.Errorf("launchpad: every lookup failed (first: %s)", errs[0])
+	}
+	if len(errs) > 0 {
+		fmt.Fprintf(o.Log, "launchpad: %d of %d packages failed after retry\n", len(errs), len(names))
 	}
 	return out, nil
 }

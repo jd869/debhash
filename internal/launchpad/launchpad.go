@@ -24,8 +24,10 @@ import (
 	"github.com/jd869/debhash/internal/archive"
 )
 
-// DefaultAPI is the Launchpad web service root.
-const DefaultAPI = "https://api.launchpad.net/1.0"
+// DefaultAPI is the Launchpad web service root. It must be "devel": the
+// include_meta parameter of binaryFileUrls (which returns each deb's sha256)
+// does not exist in the 1.0 API, which answers 400 Bad Request.
+const DefaultAPI = "https://api.launchpad.net/devel"
 
 // Client talks to the Launchpad API.
 type Client struct {

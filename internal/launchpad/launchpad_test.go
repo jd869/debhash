@@ -2,6 +2,7 @@ package launchpad
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +58,21 @@ func TestWindow(t *testing.T) {
 	doc, err := c.Window(context.Background(), "ubuntu", "noble", "arm64", "libfoo-doc", day("2025-09-01"), day("2025-12-10"))
 	if err != nil || len(doc) != 1 || doc[0].Arch != "all" {
 		t.Fatalf("arch-independent = %+v %v", doc, err)
+	}
+}
+
+// Regression: the 1.0 API rejects include_meta (400 Bad Request), so the
+// client must use devel to get each deb's sha256.
+func TestV1APIRejectsIncludeMeta(t *testing.T) {
+	lp := lptest.New(t)
+	lp.Add(lptest.Pub{Name: "libfoo1", Version: "1.1", Pocket: "Updates", Published: "2025-10-01T10:00:00+00:00", SHA256: "bb"})
+	c := &Client{API: lp.URLv1()}
+	_, err := c.Window(context.Background(), "ubuntu", "noble", "arm64", "libfoo1", day("2025-09-01"), day("2025-12-10"))
+	if err == nil || !strings.Contains(err.Error(), "400") {
+		t.Fatalf("want 400 from 1.0 API, got %v", err)
+	}
+	if !strings.HasSuffix(DefaultAPI, "/devel") {
+		t.Fatalf("DefaultAPI must be the devel API, got %s", DefaultAPI)
 	}
 }
 

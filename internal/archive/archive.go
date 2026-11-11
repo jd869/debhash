@@ -70,12 +70,14 @@ func GetURL(ctx context.Context, client *http.Client, url string) (*http.Respons
 		client = http.DefaultClient
 	}
 	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
+	// 6 attempts, backing off 2s, 4s, 8s, 16s, 32s: rides out a minute or so
+	// of an overloaded or briefly unreachable server.
+	for attempt := 0; attempt < 6; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * 2 * time.Second):
+			case <-time.After(time.Second << attempt):
 			}
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

@@ -37,8 +37,12 @@ func New(t testing.TB) *Server {
 	return s
 }
 
-// URL is the API root to pass as launchpad.Client.API.
-func (s *Server) URL() string { return s.srv.URL }
+// URL is the API root to pass as launchpad.Client.API. Like the real
+// service, only the devel API accepts binaryFileUrls' include_meta.
+func (s *Server) URL() string { return s.srv.URL + "/devel" }
+
+// URLv1 is the 1.0 API root, which rejects include_meta with 400.
+func (s *Server) URLv1() string { return s.srv.URL + "/1.0" }
 
 // Add publishes p.
 func (s *Server) Add(p Pub) {
@@ -76,6 +80,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		http.NotFound(w, r)
+	case q.Get("include_meta") != "" && !strings.HasPrefix(r.URL.Path, "/devel/"):
+		http.Error(w, "include_meta: unknown parameter in this API version", http.StatusBadRequest)
 	case q.Get("ws.op") == "getPublishedBinaries":
 		var entries []map[string]any
 		for i, p := range s.pubs {
@@ -86,7 +92,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 				"binary_package_name": p.Name, "binary_package_version": p.Version,
 				"architecture_specific": !p.ArchIndep, "pocket": p.Pocket, "status": "Published",
 				"component_name": "main", "source_package_name": p.Name + "-src", "source_package_version": p.Version,
-				"date_published": p.Published, "self_link": fmt.Sprintf("%s/ubuntu/+archive/primary/+binarypub/%d", s.srv.URL, i),
+				"date_published": p.Published, "self_link": fmt.Sprintf("%s/ubuntu/+archive/primary/+binarypub/%d", apiRoot(s.srv.URL, r.URL.Path), i),
 			}
 			if p.Superseded != "" {
 				e["date_superseded"] = p.Superseded
@@ -112,4 +118,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// apiRoot returns server+"/devel" or server+"/1.0", matching the request.
+func apiRoot(server, path string) string {
+	if strings.HasPrefix(path, "/1.0/") {
+		return server + "/1.0"
+	}
+	return server + "/devel"
 }
