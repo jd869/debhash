@@ -295,13 +295,15 @@ func PURL(c Candidate) string {
 	b.WriteString(c.Distro)
 	b.WriteString("/")
 	b.WriteString(url.PathEscape(c.Name))
-	b.WriteString("@")
-	// Epochs ("1:2.3-1") contain ':' which purl requires percent-encoded.
-	b.WriteString(strings.ReplaceAll(url.PathEscape(c.Version), ":", "%3A"))
+	if c.Version != "" { // empty: the version is unknown (purl allows that)
+		b.WriteString("@")
+		// Epochs ("1:2.3-1") contain ':' which purl requires percent-encoded.
+		b.WriteString(strings.ReplaceAll(url.PathEscape(c.Version), ":", "%3A"))
+	}
 	q := []string{"arch=" + url.QueryEscape(c.Arch)}
 	if c.Source != "" && c.Source != c.Name {
 		up := c.Source
-		if c.SourceVersion != "" && c.SourceVersion != c.Version {
+		if c.Version != "" && c.SourceVersion != "" && c.SourceVersion != c.Version {
 			up += "@" + c.SourceVersion
 		}
 		q = append(q, "upstream="+url.QueryEscape(up))

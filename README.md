@@ -88,12 +88,14 @@ curl -s -XPOST localhost:8080/v1/bulk/sha256 \
 |---|---|
 | `GET /v1/sha256/{hash}?distro=&suite=&arch=&limit=` | `{sha256, fanout, candidates[]}`, or 404 |
 | `POST /v1/bulk/sha256` `{hashes[≤1000], hint{distro,suite,arch}, limit}` | `{results[], missing[]}` |
+| `POST /v1/attribute` `{files[{path,sha256}], hint?}` | identified packages with the files assigned to each, plus the distro/suite/arch used (detected when the hint is empty) |
 | `GET /v1/packages/{id}/files` | full file manifest of one .deb |
 | `GET /v1/stats` | totals and per-suite coverage with last-ingested time |
 
 - **Filters:** `suite=noble` also matches `noble-updates`, `noble-security` and the other pockets; `arch=arm64` also matches `all`.
 - **`fanout`:** the number of distinct package names that ship the same content. Licence texts, CA certificates and locale data are shared by many packages, so a client should not identify a package from a high-fanout file on its own.
 - **Each candidate** carries a syft-compatible PURL, so packages found by hash dedupe with packages syft finds in the dpkg database.
+- **`/v1/attribute`** is what sbomit calls. When files narrow a package down to several versions (e.g. pure-Python packages whose files didn't change), it returns `exact: false`, a PURL without a version, and the candidate `versions`, rather than guessing.
 
 ## Attribution rules (previewed by `report`, to be used by the sbomit client)
 

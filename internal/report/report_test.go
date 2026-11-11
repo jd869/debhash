@@ -80,6 +80,15 @@ func TestBuild(t *testing.T) {
 	if !strings.Contains(libc.PURL, "libc6@2.39-0ubuntu8.4?arch=arm64") {
 		t.Fatalf("purl = %s", libc.PURL)
 	}
+	// Both libc6 files are assigned to it, by hash.
+	if len(libc.Matched) != 2 || libc.Matched[0].Evidence != EvidenceHash || libc.Matched[1].Path != "/usr/share/i18n/C" {
+		t.Fatalf("libc6 matched files = %+v", libc.Matched)
+	}
+	// libpython3.12-stdlib has no hash hit, so it is not identified and the
+	// .pyc has no package (with a version) to go to.
+	if r.Pyc.Assigned != 0 {
+		t.Fatalf("pyc assigned = %d", r.Pyc.Assigned)
+	}
 	// High fan-out licence must not invent pkg0..pkg5.
 	if _, ok := byName["pkg0"]; ok {
 		t.Fatal("high fan-out file created a package")

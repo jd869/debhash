@@ -19,8 +19,8 @@ import (
 
 // File is one attested file.
 type File struct {
-	Path   string // absolute, cleaned
-	SHA256 string // lower-case hex
+	Path   string `json:"path"`   // absolute, cleaned
+	SHA256 string `json:"sha256"` // lower-case hex
 }
 
 // ReadFile parses a witness DSSE envelope or a bare in-toto statement.

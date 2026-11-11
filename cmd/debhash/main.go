@@ -192,7 +192,14 @@ func cmdReport(ctx context.Context, args []string) error {
 		return err
 	}
 	defer st.Close()
-	r, err := report.Build(ctx, st, files, store.Filter{Distro: *distro, Suite: *suite, Arch: *arch})
+	filter := store.Filter{Distro: *distro, Suite: *suite, Arch: *arch}
+	if filter == (store.Filter{}) {
+		if filter, err = report.DetectFilter(ctx, st, files); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "detected: distro=%q suite=%q arch=%q\n", filter.Distro, filter.Suite, filter.Arch)
+	}
+	r, err := report.Build(ctx, st, files, filter)
 	if err != nil {
 		return err
 	}

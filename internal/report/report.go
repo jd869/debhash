@@ -53,6 +53,9 @@ type PycStat struct {
 	Total      int `json:"total"`
 	ViaSource  int `json:"attributed_via_source"`
 	NoSourceIx int `json:"source_not_indexed"`
+	// Assigned counts .pyc files given to a package that was identified by
+	// hash (so the version is known).
+	Assigned int `json:"assigned"`
 }
 
 // Distro is what /etc/os-release resolved to.
@@ -71,10 +74,33 @@ type Package struct {
 	Arch     string   `json:"arch"`
 	Files    int      `json:"files"`   // attested files attributed by hash
 	Anchors  int      `json:"anchors"` // of those, unique to this package
-	PURL     string   `json:"purl,omitempty"`
+	// Exact is true when one version survived. PURL then carries it;
+	// otherwise PURL has no version and Versions lists the candidates.
+	Exact bool   `json:"exact"`
+	PURL  string `json:"purl"`
 	// PinnedVia names the sibling binary (same source package) whose exact
 	// version narrowed this one, when its own files were ambiguous.
 	PinnedVia string `json:"pinned_via,omitempty"`
+	// Matched lists the attested files assigned to this package.
+	Matched []FileMatch `json:"files_matched,omitempty"`
+}
+
+// Evidence says how a file was tied to a package.
+type Evidence string
+
+const (
+	// EvidenceHash: the file's sha256 is shipped by the package.
+	EvidenceHash Evidence = "hash"
+	// EvidencePycSource: a generated __pycache__/*.pyc whose .py source the
+	// package ships.
+	EvidencePycSource Evidence = "pyc-source"
+)
+
+// FileMatch is one attested file assigned to a package.
+type FileMatch struct {
+	Path     string   `json:"path"`
+	SHA256   string   `json:"sha256"`
+	Evidence Evidence `json:"evidence"`
 }
 
 // Miss is an attested system file not found in the index.
@@ -150,6 +176,11 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 		srcVer   map[string]string // binary version -> source version
 	}
 	pk := map[string]*agg{}
+	type hitFile struct {
+		file  attest.File
+		names []string
+	}
+	var hitFiles []hitFile
 	for _, file := range files {
 		c := cat[file.Path]
 		if c == attest.CatNotSystem || c == attest.CatPyc {
@@ -162,6 +193,16 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 		}
 		r.Hits++
 		r.ByCategory[c].Hits++
+		names := map[string]bool{}
+		for _, cand := range hit.Candidates {
+			names[cand.Name] = true
+		}
+		hf := hitFile{file: file}
+		for n := range names {
+			hf.names = append(hf.names, n)
+		}
+		sort.Strings(hf.names)
+		hitFiles = append(hitFiles, hf)
 		if hit.Fanout > HighFanout {
 			r.HighFanout++
 			continue // never identifies a package on its own
@@ -217,16 +258,18 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 
 	// .pyc: attribute via the .py source path.
 	r.Pyc.Total = len(pycs)
+	srcOf := map[string]string{}
+	var owners map[string][]store.Candidate
 	if len(pycs) > 0 {
 		var srcs []string
-		srcOf := map[string]string{}
 		for _, p := range pycs {
 			if s, ok := attest.PycSource(p.Path); ok {
 				srcs = append(srcs, s)
 				srcOf[p.Path] = s
 			}
 		}
-		owners, err := st.LookupPaths(ctx, srcs, f)
+		var err error
+		owners, err = st.LookupPaths(ctx, srcs, f)
 		if err != nil {
 			return nil, err
 		}
@@ -274,6 +317,40 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 		}
 	}
 
+	// Assign each matched file to one identified package. Files shared by
+	// several packages (including high fan-out ones) go to the identified
+	// candidate with the most anchors, so they never create a package.
+	best := func(names []string) string {
+		pick := ""
+		for _, n := range names {
+			a := pk[n]
+			if a == nil || a.anchors == 0 {
+				continue
+			}
+			if pick == "" || a.anchors > pk[pick].anchors {
+				pick = n
+			}
+		}
+		return pick
+	}
+	matched := map[string][]FileMatch{}
+	for _, hf := range hitFiles {
+		if n := best(hf.names); n != "" {
+			matched[n] = append(matched[n], FileMatch{Path: hf.file.Path, SHA256: hf.file.SHA256, Evidence: EvidenceHash})
+		}
+	}
+	for _, p := range pycs {
+		var names []string
+		for _, c := range owners[srcOf[p.Path]] {
+			names = append(names, c.Name)
+		}
+		sort.Strings(names)
+		if n := best(names); n != "" {
+			matched[n] = append(matched[n], FileMatch{Path: p.Path, SHA256: p.SHA256, Evidence: EvidencePycSource})
+			r.Pyc.Assigned++
+		}
+	}
+
 	for name, a := range pk {
 		// Only report packages backed by at least one anchor: a file shared
 		// by a few packages must not invent the ones that are not installed.
@@ -285,11 +362,15 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 			p.Versions = append(p.Versions, v)
 		}
 		sort.Strings(p.Versions)
+		c := a.sample
+		c.Version = ""
 		if len(p.Versions) == 1 {
-			c := a.sample
 			c.Version = p.Versions[0]
-			p.PURL = store.PURL(c)
+			p.Exact = true
 		}
+		p.PURL = store.PURL(c)
+		p.Matched = matched[name]
+		sort.Slice(p.Matched, func(i, j int) bool { return p.Matched[i].Path < p.Matched[j].Path })
 		r.Packages = append(r.Packages, p)
 	}
 	sort.Slice(r.Packages, func(i, j int) bool { return r.Packages[i].Name < r.Packages[j].Name })
@@ -333,7 +414,8 @@ func (r *Report) WriteText(w io.Writer, maxMisses int) {
 	fmt.Fprintf(w, "  anchors:         %d (unique to one package)\n", r.Anchors)
 	fmt.Fprintf(w, "  exact version:   %d (one name+version+arch)\n", r.ExactVersion)
 	fmt.Fprintf(w, "  high fan-out:    %d (> %d packages; not used to identify)\n", r.HighFanout, HighFanout)
-	fmt.Fprintf(w, ".pyc files: %d, attributed via .py source: %d, source not indexed: %d\n", r.Pyc.Total, r.Pyc.ViaSource, r.Pyc.NoSourceIx)
+	fmt.Fprintf(w, ".pyc files: %d, attributed via .py source: %d (to an identified package: %d), source not indexed: %d\n",
+		r.Pyc.Total, r.Pyc.ViaSource, r.Pyc.Assigned, r.Pyc.NoSourceIx)
 	if r.Distro != nil {
 		fmt.Fprintf(w, "Distro (from /etc/os-release hash): %s %s, base-files %s (%s)\n", r.Distro.Distro, r.Distro.Release, r.Distro.Version, r.Distro.Suite)
 	} else {
@@ -381,4 +463,63 @@ func (r *Report) WriteText(w io.Writer, maxMisses int) {
 			fmt.Fprintf(w, "  %-11s %s%s\n", m.Category, m.Path, mark)
 		}
 	}
+}
+
+// multiarch maps Debian multiarch triplets (as seen in library paths) to
+// Debian architecture names.
+var multiarch = map[string]string{
+	"aarch64-linux-gnu":     "arm64",
+	"x86_64-linux-gnu":      "amd64",
+	"i386-linux-gnu":        "i386",
+	"arm-linux-gnueabihf":   "armhf",
+	"riscv64-linux-gnu":     "riscv64",
+	"s390x-linux-gnu":       "s390x",
+	"powerpc64le-linux-gnu": "ppc64el",
+}
+
+// DetectFilter works out the distro, suite and architecture of the system
+// an attestation came from, so callers need not know them:
+//   - arch from multiarch library paths (/usr/lib/aarch64-linux-gnu/...);
+//   - distro and suite from the hash of /etc/os-release, which base-files
+//     ships (one per point release).
+//
+// Fields it cannot determine are left empty, which matches everything.
+func DetectFilter(ctx context.Context, st *store.Store, files []attest.File) (store.Filter, error) {
+	var f store.Filter
+	votes := map[string]int{}
+	var osRelease []string
+	for _, file := range files {
+		for triplet, arch := range multiarch {
+			if strings.Contains(file.Path, "/"+triplet+"/") {
+				votes[arch]++
+			}
+		}
+		if file.Path == "/etc/os-release" || file.Path == "/usr/lib/os-release" {
+			osRelease = append(osRelease, file.SHA256)
+		}
+	}
+	best := 0
+	for arch, n := range votes {
+		if n > best || (n == best && arch < f.Arch) {
+			f.Arch, best = arch, n
+		}
+	}
+	if len(osRelease) > 0 {
+		res, err := st.Lookup(ctx, osRelease, store.Filter{Arch: f.Arch}, 0)
+		if err != nil {
+			return f, err
+		}
+		for _, h := range osRelease {
+			if r := res[h]; r != nil {
+				for _, c := range r.Candidates {
+					if c.Name == "base-files" {
+						f.Distro = c.Distro
+						f.Suite, _, _ = strings.Cut(c.Suite, "-") // noble-updates -> noble
+						return f, nil
+					}
+				}
+			}
+		}
+	}
+	return f, nil
 }
