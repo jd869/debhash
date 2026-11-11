@@ -1,0 +1,318 @@
+// Package ingest downloads .deb files from an APT repository, hashes every
+// file inside them and records the result in the store.
+//
+// Two selection modes:
+//
+//   - targeted: given paths from an attestation, use the Contents index
+//     (path → package, the same data apt-file uses) to fetch only the packages
+//     that ship one of those paths, in every version the pockets list;
+//   - all: every package in the selected pockets/components.
+//
+// Historical versions come from pointing Mirror at a snapshot service
+// (https://snapshot.ubuntu.com/ubuntu-ports/<timestamp>) and running again;
+// debs already stored are recognised by their sha256 and only gain a
+// publication row, so repeated snapshot runs cost only the new versions.
+package ingest
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jd869/debhash/internal/archive"
+	"github.com/jd869/debhash/internal/attest"
+	"github.com/jd869/debhash/internal/deb"
+	"github.com/jd869/debhash/internal/store"
+)
+
+// Options configures one ingest run.
+type Options struct {
+	Mirror     string
+	Distro     string   // override; defaults to the Release Origin, lower-cased
+	Suite      string   // codename: noble
+	Pockets    []string // "release", "updates", "security", "backports", "proposed"
+	Components []string // main, universe, ...
+	Arch       string   // arm64
+	Targets    []string // absolute paths from an attestation (targeted mode)
+	All        bool     // ingest every package (ignores Targets)
+	Workers    int
+	Client     *http.Client
+	Log        io.Writer
+}
+
+// Report summarises a run.
+type Report struct {
+	Indexes      int      // Packages indexes read
+	Listed       int      // stanzas across those indexes
+	Wanted       int      // package names selected
+	TargetPaths  int      // distinct target paths asked for
+	FoundPaths   int      // target paths some package ships (per Contents)
+	UniqueDebs   int      // distinct .debs selected
+	AlreadyHad   int      // of those, already in the store
+	Downloaded   int      // newly ingested
+	Bytes        int64    // bytes downloaded
+	FilesIndexed int      // file entries written
+	Failed       []string // debs that failed (with reason)
+	Duration     time.Duration
+}
+
+type pubDeb struct {
+	stanza archive.Stanza
+	pubs   []store.Publication
+}
+
+// Run executes an ingest.
+func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
+	start := time.Now()
+	if o.Workers <= 0 {
+		o.Workers = 4
+	}
+	if o.Log == nil {
+		o.Log = io.Discard
+	}
+	if !o.All && len(o.Targets) == 0 {
+		return nil, fmt.Errorf("nothing to ingest: pass target paths or select all")
+	}
+	repo := archive.Repo{Mirror: o.Mirror, Client: o.Client}
+	rep := &Report{}
+
+	// 1. Release + Packages for every pocket/component.
+	var releases []*archive.Release
+	var all []archive.Stanza
+	pubFor := map[string]store.Publication{} // suite/component -> publication
+	for _, pocket := range o.Pockets {
+		suite := o.Suite
+		if pocket != "" && pocket != "release" {
+			suite += "-" + pocket
+		}
+		rel, err := repo.Release(ctx, suite)
+		if err != nil {
+			return nil, fmt.Errorf("release %s: %w", suite, err)
+		}
+		releases = append(releases, rel)
+		distro := o.Distro
+		if distro == "" {
+			distro = strings.ToLower(rel.Origin)
+		}
+		for _, comp := range o.Components {
+			stanzas, err := repo.Packages(ctx, rel, comp, o.Arch)
+			if err != nil {
+				return nil, fmt.Errorf("packages %s/%s: %w", suite, comp, err)
+			}
+			rep.Indexes++
+			fmt.Fprintf(o.Log, "index %s/%s/binary-%s: %d packages\n", suite, comp, o.Arch, len(stanzas))
+			pubFor[suite+"/"+comp] = store.Publication{
+				Distro: distro, DistroVersion: distroVersion(distro, rel.Version),
+				Suite: suite, Component: comp, Mirror: strings.TrimRight(o.Mirror, "/"),
+			}
+			all = append(all, stanzas...)
+		}
+	}
+	rep.Listed = len(all)
+
+	// 2. Select package names.
+	var wanted map[string]bool
+	if !o.All {
+		var err error
+		wanted, err = targetPackages(ctx, repo, releases, o, rep)
+		if err != nil {
+			return nil, err
+		}
+		rep.Wanted = len(wanted)
+	}
+
+	// 3. Unique debs, each with every place it is published.
+	byDeb := map[string]*pubDeb{}
+	var order []string
+	for _, s := range all {
+		if wanted != nil && !wanted[s.Package] {
+			continue
+		}
+		if s.SHA256 == "" {
+			continue
+		}
+		key := strings.ToLower(s.SHA256)
+		pd := byDeb[key]
+		if pd == nil {
+			pd = &pubDeb{stanza: s}
+			byDeb[key] = pd
+			order = append(order, key)
+		}
+		pd.pubs = append(pd.pubs, pubFor[s.Suite+"/"+s.Component])
+	}
+	if o.All {
+		rep.Wanted = len(order)
+	}
+	rep.UniqueDebs = len(order)
+
+	var todo []*pubDeb
+	for _, key := range order {
+		pd := byDeb[key]
+		id, ok, err := st.PackageID(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			todo = append(todo, pd)
+			continue
+		}
+		rep.AlreadyHad++
+		for _, pub := range pd.pubs {
+			if err := st.AddPublication(ctx, id, pub); err != nil {
+				return nil, err
+			}
+		}
+	}
+	fmt.Fprintf(o.Log, "selected %d debs (%d already indexed, %d to download)\n", len(order), rep.AlreadyHad, len(todo))
+
+	// 4. Download + hash in parallel; one writer.
+	type result struct {
+		pd    *pubDeb
+		pkg   *deb.Package
+		bytes int64
+		err   error
+	}
+	// Cancelling on return stops workers if the writer bails out early.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan *pubDeb)
+	results := make(chan result)
+	var wg sync.WaitGroup
+	for i := 0; i < o.Workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pd := range jobs {
+				pkg, n, err := fetch(ctx, repo, pd.stanza)
+				select {
+				case results <- result{pd: pd, pkg: pkg, bytes: n, err: err}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, pd := range todo {
+			select {
+			case jobs <- pd:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() { wg.Wait(); close(results) }()
+
+	done := 0
+	for r := range results {
+		done++
+		s := r.pd.stanza
+		rep.Bytes += r.bytes
+		if r.err != nil {
+			rep.Failed = append(rep.Failed, fmt.Sprintf("%s %s: %v", s.Package, s.Version, r.err))
+			fmt.Fprintf(o.Log, "[%d/%d] FAIL %s %s: %v\n", done, len(todo), s.Package, s.Version, r.err)
+			continue
+		}
+		meta := store.PackageMeta{
+			DebSHA256: s.SHA256, Name: s.Package, Version: s.Version, Arch: s.Architecture,
+			Source: s.Source, SourceVersion: s.SourceVersion, Filename: s.Filename, Size: r.bytes,
+		}
+		// Control is authoritative; Packages should agree, but trust the deb.
+		if c := r.pkg.Control; c.Package != "" {
+			meta.Name, meta.Version, meta.Arch = c.Package, c.Version, c.Architecture
+			meta.Source, meta.SourceVersion = c.Source, c.SourceVersion
+		}
+		id, err := st.AddPackage(ctx, meta, r.pd.pubs[0], r.pkg.Entries)
+		if err != nil {
+			return nil, err
+		}
+		for _, pub := range r.pd.pubs[1:] {
+			if err := st.AddPublication(ctx, id, pub); err != nil {
+				return nil, err
+			}
+		}
+		rep.Downloaded++
+		rep.FilesIndexed += len(r.pkg.Entries)
+		fmt.Fprintf(o.Log, "[%d/%d] %s %s (%s, %.1f MB, %d files)\n", done, len(todo), meta.Name, meta.Version,
+			meta.Arch, float64(r.bytes)/1e6, len(r.pkg.Entries))
+	}
+	if err := ctx.Err(); err != nil {
+		return rep, err
+	}
+	rep.Duration = time.Since(start)
+	return rep, nil
+}
+
+// fetch streams one .deb: download → verify sha256 → parse → hash entries.
+func fetch(ctx context.Context, repo archive.Repo, s archive.Stanza) (*deb.Package, int64, error) {
+	body, err := repo.OpenPool(ctx, s.Filename)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer body.Close()
+	hr := deb.NewHashingReader(body)
+	pkg, err := deb.Read(hr)
+	if err != nil {
+		return nil, hr.N(), err
+	}
+	if err := hr.Drain(); err != nil {
+		return nil, hr.N(), err
+	}
+	if err := deb.VerifyDigest(hr.Sum(), s.SHA256); err != nil {
+		return nil, hr.N(), err
+	}
+	return pkg, hr.N(), nil
+}
+
+// targetPackages maps attested paths to the packages that ship them, using
+// the Contents indexes of every pocket.
+func targetPackages(ctx context.Context, repo archive.Repo, releases []*archive.Release, o Options, rep *Report) (map[string]bool, error) {
+	want := map[string]string{} // variant path -> original target path
+	targets := map[string]bool{}
+	for _, t := range o.Targets {
+		targets[t] = true
+		for _, v := range attest.Variants(t) {
+			want[v] = t
+		}
+	}
+	rep.TargetPaths = len(targets)
+	found := map[string]bool{}
+	names := map[string]bool{}
+	for _, rel := range releases {
+		idx := archive.ContentsIndexes(rel, o.Arch)
+		sort.Strings(idx)
+		for _, index := range idx {
+			fmt.Fprintf(o.Log, "scanning %s/%s for %d target paths\n", rel.Suite, index, len(targets))
+			err := repo.Contents(ctx, rel, index,
+				func(p string) bool { _, ok := want[p]; return ok },
+				func(p string, pkgs []string) {
+					found[want[p]] = true
+					for _, n := range pkgs {
+						names[n] = true
+					}
+				})
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	rep.FoundPaths = len(found)
+	return names, nil
+}
+
+// distroVersion normalises the Release Version field to what goes in a PURL
+// distro qualifier: Ubuntu keeps "24.04"; Debian uses the major ("12.7" → "12").
+func distroVersion(distro, v string) string {
+	if distro == "debian" {
+		if major, _, ok := strings.Cut(v, "."); ok {
+			return major
+		}
+	}
+	return v
+}
