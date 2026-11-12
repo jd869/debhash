@@ -26,6 +26,7 @@ import (
 	"github.com/jd869/debhash/internal/attest"
 	"github.com/jd869/debhash/internal/deb"
 	"github.com/jd869/debhash/internal/ingest"
+	"github.com/jd869/debhash/internal/keyring"
 	"github.com/jd869/debhash/internal/launchpad"
 	"github.com/jd869/debhash/internal/report"
 	"github.com/jd869/debhash/internal/server"
@@ -100,6 +101,8 @@ func cmdIngest(ctx context.Context, args []string) error {
 	pathsFrom := fs.String("paths-from", "", "witness attestation: only ingest packages shipping its files")
 	all := fs.Bool("all", false, "ingest every package in the selected pockets/components")
 	workers := fs.Int("workers", 4, "parallel downloads")
+	keyringPath := fs.String("keyring", "", "OpenPGP keyring that signs the archive (default: embedded Ubuntu archive keyring; e.g. /usr/share/keyrings/debian-archive-keyring.gpg for Debian)")
+	noVerify := fs.Bool("no-verify", false, "do not verify Release signatures (only for test mirrors)")
 	history := fs.String("history", "", `also ingest historical versions; "launchpad" (Ubuntu only)`)
 	after := fs.String("history-after", "", "history window start, YYYY-MM-DD")
 	before := fs.String("history-before", "", "history window end, YYYY-MM-DD (e.g. the build date)")
@@ -109,7 +112,18 @@ func cmdIngest(ctx context.Context, args []string) error {
 	opts := ingest.Options{
 		Mirror: *mirror, Distro: *distro, Suite: *suite, Pockets: splitList(*pockets),
 		Components: splitList(*components), Arch: *arch, All: *all, Workers: *workers,
-		Client: &http.Client{Timeout: 10 * time.Minute}, Log: os.Stderr,
+		Client: &http.Client{Timeout: 10 * time.Minute}, Log: os.Stderr, NoVerify: *noVerify,
+	}
+	if !*noVerify {
+		var err error
+		if *keyringPath != "" {
+			opts.Keyring, err = keyring.Load(*keyringPath)
+		} else {
+			opts.Keyring, err = keyring.Ubuntu()
+		}
+		if err != nil {
+			return err
+		}
 	}
 	switch *history {
 	case "":

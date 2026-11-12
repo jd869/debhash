@@ -2,15 +2,17 @@
 // snapshot of either): the Release file, Packages indexes, Contents indexes and
 // pool files.
 //
-// Every index we download is checked against the sha256 listed in Release, and
-// every .deb is checked against the sha256 in Packages. The Release file's own
-// GPG signature (InRelease) is NOT verified yet; that is a known gap for a
-// production deployment.
+// The chain of trust is complete: the Release file is accepted only if its
+// OpenPGP signature (InRelease, or Release + Release.gpg) verifies against the
+// archive keyring; every index is checked against the sha256 listed in
+// Release; and every .deb against the sha256 in Packages.
 package archive
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,8 +21,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+
 	"github.com/jd869/debhash/internal/deb"
 	"github.com/jd869/debhash/internal/decompress"
+	"github.com/jd869/debhash/internal/keyring"
 )
 
 // Repo is one mirror base URL, e.g. http://ports.ubuntu.com/ubuntu-ports or
@@ -28,6 +34,11 @@ import (
 type Repo struct {
 	Mirror string
 	Client *http.Client
+	// Keyring holds the archive signing keys. Release files must be signed
+	// by one of them unless NoVerify is set.
+	Keyring openpgp.EntityList
+	// NoVerify skips signature checks (only for test mirrors).
+	NoVerify bool
 }
 
 // Release is a parsed dists/<suite>/Release file.
@@ -37,7 +48,21 @@ type Release struct {
 	Version string // 24.04, 12.7
 	Date    string
 	Files   map[string]IndexFile // path relative to dists/<suite>/
+	// SignedBy describes the key that signed it ("" when not verified).
+	SignedBy string
 }
+
+// StatusError is a non-retryable HTTP error response.
+type StatusError struct {
+	URL    string
+	Code   int
+	Status string
+}
+
+func (e *StatusError) Error() string { return "GET " + e.URL + ": " + e.Status }
+
+// ErrBadSignature is returned when a Release file's signature does not verify.
+var ErrBadSignature = errors.New("release signature does not verify")
 
 // IndexFile is one entry of the Release SHA256 section.
 type IndexFile struct {
@@ -99,26 +124,77 @@ func GetURL(ctx context.Context, client *http.Client, url string) (*http.Respons
 			continue
 		default:
 			resp.Body.Close()
-			return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
+			return nil, &StatusError{URL: url, Code: resp.StatusCode, Status: resp.Status}
 		}
 	}
 	return nil, lastErr
 }
 
-// Release fetches and parses dists/<suite>/Release.
+// Release fetches, verifies and parses the Release file of a suite.
+//
+// It prefers InRelease (the clear-signed Release). If the mirror has none,
+// it uses Release plus the detached Release.gpg. With NoVerify it reads the
+// plain Release without checking anything.
 func (r Repo) Release(ctx context.Context, suite string) (*Release, error) {
-	resp, err := r.Get(ctx, "dists/"+suite+"/Release")
+	dir := "dists/" + suite + "/"
+	if r.NoVerify {
+		b, err := r.fetch(ctx, dir+"Release")
+		if err != nil {
+			return nil, err
+		}
+		rel := ParseRelease(string(b))
+		rel.Suite = suite
+		return rel, nil
+	}
+	if len(r.Keyring) == 0 {
+		return nil, errors.New("no archive keyring: cannot verify Release (use NoVerify only for test mirrors)")
+	}
+
+	var plain []byte
+	var signer *openpgp.Entity
+	in, err := r.fetch(ctx, dir+"InRelease")
+	var se *StatusError
+	switch {
+	case err == nil:
+		block, _ := clearsign.Decode(in)
+		if block == nil {
+			return nil, fmt.Errorf("%sInRelease: %w: not a clear-signed message", dir, ErrBadSignature)
+		}
+		signer, err = openpgp.CheckDetachedSignature(r.Keyring, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, nil)
+		if err != nil {
+			return nil, fmt.Errorf("%sInRelease: %w: %v", dir, ErrBadSignature, err)
+		}
+		plain = block.Plaintext
+	case errors.As(err, &se) && se.Code == http.StatusNotFound:
+		plain, err = r.fetch(ctx, dir+"Release")
+		if err != nil {
+			return nil, err
+		}
+		sig, err := r.fetch(ctx, dir+"Release.gpg")
+		if err != nil {
+			return nil, fmt.Errorf("no InRelease and no Release.gpg for %s: %w", suite, err)
+		}
+		signer, err = openpgp.CheckArmoredDetachedSignature(r.Keyring, bytes.NewReader(plain), bytes.NewReader(sig), nil)
+		if err != nil {
+			return nil, fmt.Errorf("%sRelease.gpg: %w: %v", dir, ErrBadSignature, err)
+		}
+	default:
+		return nil, err
+	}
+	rel := ParseRelease(string(plain))
+	rel.Suite = suite
+	rel.SignedBy = keyring.Describe(signer)
+	return rel, nil
+}
+
+// fetch downloads a small file (Release, InRelease, Release.gpg) in full.
+func (r Repo) fetch(ctx context.Context, rel string) ([]byte, error) {
+	resp, err := r.Get(ctx, rel)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return nil, err
-	}
-	rel := ParseRelease(string(b))
-	rel.Suite = suite
-	return rel, nil
+	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }
 
 // ParseRelease parses the fields and the SHA256 file list of a Release file.

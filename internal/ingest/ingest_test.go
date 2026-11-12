@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+
+	"github.com/jd869/debhash/internal/archive"
 	"github.com/jd869/debhash/internal/debtest"
 	"github.com/jd869/debhash/internal/launchpad"
 	"github.com/jd869/debhash/internal/launchpad/lptest"
@@ -68,8 +72,11 @@ func (f *fakeRepo) addSuite(t *testing.T, suite string, debs []debSpec) {
 	ct := debtest.Gzip(t, []byte(contents.String()))
 	f.files["dists/"+suite+"/main/binary-arm64/Packages.gz"] = pk
 	f.files["dists/"+suite+"/Contents-arm64.gz"] = ct
-	f.files["dists/"+suite+"/Release"] = []byte(fmt.Sprintf("Origin: Ubuntu\nVersion: 24.04\nSuite: %s\nSHA256:\n %s %d main/binary-arm64/Packages.gz\n %s %d Contents-arm64.gz\n",
+	release := []byte(fmt.Sprintf("Origin: Ubuntu\nVersion: 24.04\nSuite: %s\nSHA256:\n %s %d main/binary-arm64/Packages.gz\n %s %d Contents-arm64.gz\n",
 		suite, debtest.SHA256Bytes(pk), len(pk), debtest.SHA256Bytes(ct), len(ct)))
+	f.files["dists/"+suite+"/Release"] = release
+	// Mirrors publish the clear-signed InRelease; ingest verifies it.
+	f.files["dists/"+suite+"/InRelease"] = debtest.ClearSign(t, debtest.SigningKey(t), release)
 }
 
 func buildDeb(t *testing.T, d debSpec) []byte {
@@ -99,7 +106,8 @@ func TestRunTargetedTwoPockets(t *testing.T) {
 	}
 	defer st.Close()
 	opts := Options{
-		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release", "updates"},
+		Keyring: testKeyring(t),
+		Mirror:  srv.URL, Suite: "noble", Pockets: []string{"release", "updates"},
 		Components: []string{"main"}, Arch: "arm64", Workers: 2,
 		// /lib spelling must match the /usr/lib path in Contents (merged /usr).
 		Targets: []string{"/lib/aarch64-linux-gnu/libfoo.so.1", "/usr/lib/libbad.so", "/opt/not/packaged"},
@@ -179,7 +187,8 @@ func TestRunWithLaunchpadHistory(t *testing.T) {
 	before, _ := time.Parse("2006-01-02", "2025-12-10")
 	ctx := context.Background()
 	rep, err := Run(ctx, st, Options{
-		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release", "updates"},
+		Keyring: testKeyring(t),
+		Mirror:  srv.URL, Suite: "noble", Pockets: []string{"release", "updates"},
 		Components: []string{"main"}, Arch: "arm64", Workers: 2,
 		Targets: []string{"/usr/lib/aarch64-linux-gnu/libfoo.so.1"},
 		History: &History{Launchpad: &launchpad.Client{API: lp.URL()}, After: after, Before: before},
@@ -217,7 +226,8 @@ func TestRunRetriesFailedDownloads(t *testing.T) {
 	}
 	defer st.Close()
 	rep, err := Run(context.Background(), st, Options{
-		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
+		Keyring: testKeyring(t),
+		Mirror:  srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
 		Arch: "arm64", Targets: []string{"/usr/lib/libfoo.so.1"},
 	})
 	if err != nil {
@@ -243,7 +253,8 @@ func TestRunFollowsSymlinks(t *testing.T) {
 	}
 	defer st.Close()
 	rep, err := Run(context.Background(), st, Options{
-		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
+		Keyring: testKeyring(t),
+		Mirror:  srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
 		Arch: "arm64", Targets: []string{"/usr/bin/python3"},
 	})
 	if err != nil {
@@ -283,7 +294,8 @@ func TestHistoryRunFollowsSymlinkAlreadyIndexed(t *testing.T) {
 	defer st.Close()
 	ctx := context.Background()
 	base := Options{
-		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
+		Keyring: testKeyring(t),
+		Mirror:  srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
 		Arch: "arm64", Targets: []string{"/usr/bin/python3"},
 	}
 	if _, err := Run(ctx, st, base); err != nil { // step 1: current versions
@@ -299,5 +311,38 @@ func TestHistoryRunFollowsSymlinkAlreadyIndexed(t *testing.T) {
 	res, err := st.Lookup(ctx, []string{debtest.SHA256("python 0.8")}, store.Filter{}, 0)
 	if err != nil || res[debtest.SHA256("python 0.8")] == nil {
 		t.Fatalf("historical python3.12-minimal behind the symlink was not fetched: %v %v", res, err)
+	}
+}
+
+// testKeyring trusts the key the fake mirrors sign with.
+func testKeyring(t *testing.T) openpgp.EntityList {
+	return debtest.Keyring(debtest.SigningKey(t))
+}
+
+// A mirror whose InRelease is signed by a key we don't trust is refused
+// before anything is downloaded.
+func TestRunRefusesUntrustedMirror(t *testing.T) {
+	repo := &fakeRepo{files: map[string][]byte{}}
+	repo.addSuite(t, "noble", []debSpec{{name: "libfoo1", version: "1.0", arch: "arm64", file: "/usr/lib/libfoo.so.1", body: "foo"}})
+	srv := httptest.NewServer(repo)
+	defer srv.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "idx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	stranger, err := debtest.NewKey("Not The Archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Run(context.Background(), st, Options{
+		Mirror: srv.URL, Suite: "noble", Pockets: []string{"release"}, Components: []string{"main"},
+		Arch: "arm64", Targets: []string{"/usr/lib/libfoo.so.1"}, Keyring: debtest.Keyring(stranger),
+	})
+	if !errors.Is(err, archive.ErrBadSignature) {
+		t.Fatalf("want ErrBadSignature, got %v", err)
+	}
+	if stats, _ := st.Stats(context.Background()); stats.Packages != 0 {
+		t.Fatalf("nothing should be ingested from an untrusted mirror, got %d packages", stats.Packages)
 	}
 }

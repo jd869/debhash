@@ -24,6 +24,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+
 	"github.com/jd869/debhash/internal/archive"
 	"github.com/jd869/debhash/internal/attest"
 	"github.com/jd869/debhash/internal/deb"
@@ -44,6 +46,10 @@ type Options struct {
 	Workers    int
 	Client     *http.Client
 	Log        io.Writer
+	// Keyring verifies each Release file's signature; NoVerify skips that
+	// (only for test mirrors).
+	Keyring  openpgp.EntityList
+	NoVerify bool
 	// History, when set, also ingests every version of the targeted packages
 	// that Launchpad says was live in [After, Before]: the versions a build
 	// at that time could have installed, which the live mirror no longer has.
@@ -99,7 +105,7 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 	if o.History != nil && o.All {
 		return nil, fmt.Errorf("history needs targeted mode: full-suite history would download every version of everything")
 	}
-	repo := archive.Repo{Mirror: o.Mirror, Client: o.Client}
+	repo := archive.Repo{Mirror: o.Mirror, Client: o.Client, Keyring: o.Keyring, NoVerify: o.NoVerify}
 	rep := &Report{}
 
 	// 1. Release + Packages for every pocket/component.
@@ -117,6 +123,11 @@ func Run(ctx context.Context, st *store.Store, o Options) (*Report, error) {
 			return nil, fmt.Errorf("release %s: %w", suite, err)
 		}
 		releases = append(releases, rel)
+		if rel.SignedBy != "" {
+			fmt.Fprintf(o.Log, "release %s: signature OK, %s\n", suite, rel.SignedBy)
+		} else {
+			fmt.Fprintf(o.Log, "release %s: signature NOT verified (--no-verify)\n", suite)
+		}
 		distro = o.Distro
 		if distro == "" {
 			distro = strings.ToLower(rel.Origin)

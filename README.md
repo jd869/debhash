@@ -45,7 +45,12 @@ SQLite: packages (one row per .deb) · publications (suite/pocket/mirror) · fil
 ```
 
 - **Nothing is written to disk but the index.** Each .deb is hashed while it downloads.
-- **Integrity:** index files are checked against the sha256 in `Release`, and every .deb against the sha256 in `Packages`. The `InRelease` GPG signature is **not** verified yet.
+- **Integrity, end to end:** Ubuntu's archive key → `Release` → `Packages`/`Contents` → each .deb.
+  - `InRelease` (or `Release` + `Release.gpg`) must carry a valid OpenPGP signature from a key in the archive keyring, or the run stops before downloading anything.
+  - The Ubuntu archive keyring is embedded (2012 and 2018 archive keys, from the `ubuntu-keyring` package). For other archives, pass `--keyring`, e.g. `/usr/share/keyrings/debian-archive-keyring.gpg`.
+  - Index files are checked against the sha256 in the verified `Release`, and every .deb against the sha256 in `Packages`.
+  - Debs from Launchpad history are checked against the sha256 Launchpad's API returns over HTTPS. They are not covered by the archive signature, because they are no longer in any signed index.
+  - `--no-verify` turns signature checks off; it is only meant for test mirrors.
 - **Dedup:** a .deb published in several pockets (or as `Architecture: all`) is downloaded and stored once, with one publication row per location.
 - **Targeted ingest** (`--paths-from`) uses the `Contents-<arch>` index (path → package, the same data as `apt-file`) to fetch only the packages that ship a file in the attestation.
   - Merged-`/usr` spellings (`/lib/…` vs `/usr/lib/…`) are both tried.
@@ -80,6 +85,8 @@ curl -s -XPOST localhost:8080/v1/bulk/sha256 \
   -d '{"hashes":["<sha256>","<sha256>"],"hint":{"distro":"ubuntu","suite":"noble","arch":"arm64"}}'
 ```
 
+Each ingest logs who signed every Release, e.g. `release noble-updates: signature OK, F6ECB3762474EDA9D21B7022871920D1991BC93C (Ubuntu Archive Automatic Signing Key (2018) <ftpmaster@ubuntu.com>)`.
+
 `debhash inspect file.deb` prints the sha256 of every file in a local .deb. It's useful for checking results against `dpkg-deb -x` + `sha256sum`.
 
 ## API
@@ -109,6 +116,7 @@ curl -s -XPOST localhost:8080/v1/bulk/sha256 \
 
 ```sh
 go test ./...   # unit + end-to-end ingest against an in-process fake mirror
+DEBHASH_NETWORK_TESTS=1 go test ./internal/archive/   # also verify the live Ubuntu archive signature
 go vet ./...
 ```
 
