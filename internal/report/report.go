@@ -121,6 +121,26 @@ var generatedFiles = map[string]bool{
 	"/usr/lib/ssl/cert.pem":              true, // symlink to the bundle above
 }
 
+// generatedPrefixes are config files that container images add on top of the
+// packages (Docker's official ubuntu/debian images write these).
+var generatedPrefixes = []string{
+	"/etc/apt/apt.conf.d/docker-",
+	"/etc/dpkg/dpkg.cfg.d/docker-",
+	"/etc/dpkg/dpkg.cfg.d/excludes",
+}
+
+func isGenerated(p string) bool {
+	if generatedFiles[p] {
+		return true
+	}
+	for _, pre := range generatedPrefixes {
+		if strings.HasPrefix(p, pre) {
+			return true
+		}
+	}
+	return false
+}
+
 // Build measures files against the store.
 func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Filter) (*Report, error) {
 	r := &Report{Filter: f, Attested: len(files), ByCategory: map[attest.Category]*Stat{}}
@@ -188,7 +208,7 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 		}
 		hit := res[file.SHA256]
 		if hit == nil {
-			r.Misses = append(r.Misses, Miss{Path: file.Path, Category: c, Generated: generatedFiles[file.Path]})
+			r.Misses = append(r.Misses, Miss{Path: file.Path, Category: c, Generated: isGenerated(file.Path)})
 			continue
 		}
 		r.Hits++

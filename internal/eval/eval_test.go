@@ -130,3 +130,29 @@ func TestTruth(t *testing.T) {
 		t.Fatalf("truth = %+v", tr)
 	}
 }
+
+// Libraries are opened through soname symlinks; the touched strategy must
+// follow them to the regular file the package ships.
+func TestTouchedFollowsSymlinks(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "idx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pub := store.Publication{Distro: "ubuntu", DistroVersion: "22.04", Suite: "jammy", Component: "main", Mirror: "m"}
+	if _, err := st.AddPackage(ctx, store.PackageMeta{DebSHA256: "x", Name: "libcap2", Version: "1:2.44-1build3", Arch: "amd64"}, pub, []deb.Entry{
+		{Path: "/lib/x86_64-linux-gnu/libcap.so.2.44", Kind: deb.KindFile, SHA256: debtest.SHA256("cap")},
+		{Path: "/lib/x86_64-linux-gnu/libcap.so.2", Kind: deb.KindSymlink, LinkTarget: "libcap.so.2.44"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sums, _, err := Synthetic(ctx, st, Options{Strategies: []Strategy{StrategyTouched},
+		Touched: map[string]bool{"/usr/lib/x86_64-linux-gnu/libcap.so.2": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := byStrategy(sums, StrategyTouched); s.Queries != 1 || s.ExactCorrect != 1 {
+		t.Fatalf("touched via symlink = %+v", s)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"path"
 	"sort"
 	"strings"
 
@@ -123,7 +124,16 @@ func run(ctx context.Context, st *store.Store, o Options, hide bool) ([]Summary,
 			return nil, nil, err
 		}
 		var own []attest.File
+		links := map[string]string{} // symlink path -> absolute target
 		for _, f := range manifest {
+			if f.Kind == "symlink" && f.LinkTarget != "" {
+				t := f.LinkTarget
+				if !strings.HasPrefix(t, "/") {
+					t = path.Join(path.Dir(f.Path), t)
+				}
+				links[f.Path] = path.Clean(t)
+				continue
+			}
 			if f.SHA256 == "" || f.Kind == "symlink" {
 				continue
 			}
@@ -134,7 +144,7 @@ func run(ctx context.Context, st *store.Store, o Options, hide bool) ([]Summary,
 			own = append(own, attest.File{Path: f.Path, SHA256: f.SHA256})
 		}
 		for _, s := range o.Strategies {
-			files := pick(s, own, o.Touched, rng)
+			files := pick(s, own, links, o.Touched, rng)
 			c := Case{Package: d.Name, Version: d.Version, Strategy: s, Files: len(files)}
 			if len(files) == 0 {
 				c.Outcome = Skipped
@@ -156,7 +166,7 @@ func run(ctx context.Context, st *store.Store, o Options, hide bool) ([]Summary,
 	return summarize(o.Strategies, cases), cases, nil
 }
 
-func pick(s Strategy, own []attest.File, touched map[string]bool, rng *rand.Rand) []attest.File {
+func pick(s Strategy, own []attest.File, links map[string]string, touched map[string]bool, rng *rand.Rand) []attest.File {
 	switch s {
 	case StrategyAll:
 		return own
@@ -174,10 +184,27 @@ func pick(s Strategy, own []attest.File, touched map[string]bool, rng *rand.Rand
 		}
 		return []attest.File{own[rng.Intn(len(own))]}
 	case StrategyTouched:
+		// A build opens libraries through their soname symlinks
+		// (libcap.so.2 -> libcap.so.2.44), and witness hashes the target.
+		// So a regular file counts as touched if it, or a symlink chain
+		// ending at it, was opened.
+		reached := map[string]bool{}
+		for t := range touched {
+			for _, p := range attest.Variants(t) {
+				for hop := 0; hop < 4; hop++ {
+					reached[p] = true
+					next, ok := links[p]
+					if !ok {
+						break
+					}
+					p = next
+				}
+			}
+		}
 		var out []attest.File
 		for _, f := range own {
 			for _, v := range attest.Variants(f.Path) {
-				if touched[v] {
+				if reached[v] {
 					out = append(out, f)
 					break
 				}
@@ -315,7 +342,7 @@ func Truth(ctx context.Context, st *store.Store, files []attest.File, dpkg map[s
 	if err != nil {
 		return nil, err
 	}
-	tr := &TruthResult{Installed: len(dpkg), Identified: len(r.Packages)}
+	tr := &TruthResult{Installed: len(dpkg), Identified: len(r.Packages), Wrong: []string{}, NotInstalled: []string{}, IndexGaps: []string{}}
 	seen := map[string]bool{}
 	for _, p := range r.Packages {
 		seen[p.Name] = true
