@@ -160,6 +160,13 @@ func TestAttribute(t *testing.T) {
 		t.Fatalf("misses=%+v distro=%+v", out.Misses, out.Distro)
 	}
 
+	// With an installed list that disagrees, libc6 is flagged, not changed.
+	_, withDpkg := post(`{"files":[{"path":"/lib/aarch64-linux-gnu/libc.so.6","sha256":"` + debtest.SHA256("libc") + `"}],
+		"installed":[{"name":"libc6:arm64","version":"2.39-0ubuntu8.4"}]}`)
+	if len(withDpkg.Packages) != 1 || withDpkg.Packages[0].Confidence != "mismatch" || withDpkg.Packages[0].Dpkg != "2.39-0ubuntu8.4" {
+		t.Fatalf("installed list not applied: %+v", withDpkg.Packages)
+	}
+
 	for _, bad := range []string{`{"files":[]}`, `{"files":[{"path":"relative","sha256":"` + debtest.SHA256("x") + `"}]}`, `{"files":[{"path":"/x","sha256":"zz"}]}`} {
 		if resp, _ := post(bad); resp.StatusCode != 400 {
 			t.Errorf("%s: status %d, want 400", bad, resp.StatusCode)

@@ -78,11 +78,20 @@ type Package struct {
 	// otherwise PURL has no version and Versions lists the candidates.
 	Exact bool   `json:"exact"`
 	PURL  string `json:"purl"`
-	// Confidence is "exact" (one version, nothing contradicts it),
-	// "ambiguous" (several versions fit) or "conflict" (every candidate
-	// version is contradicted by an attested file: the installed version is
-	// most likely not in the index, so no version is claimed).
+	// Confidence:
+	//   exact       one version fits the files and nothing contradicts it
+	//   exact_dpkg  several versions fit the files; dpkg's version is one
+	//               of them and was picked
+	//   ambiguous   several versions fit, no dpkg list to decide
+	//   conflict    every candidate is contradicted by an attested file: the
+	//               installed version is not in the index; no version claimed
+	//   dpkg_only   conflict, and dpkg names a version the index lacks; that
+	//               version is reported but not verified by hashes
+	//   mismatch    the files fit, but dpkg names a version they rule out
+	//               (partial upgrade or tampered dpkg database): review
 	Confidence string `json:"confidence"`
+	// Dpkg is the version the installed-packages list gives, if any.
+	Dpkg string `json:"dpkg_version,omitempty"`
 	// Conflicts are attested paths that contradicted the candidates.
 	Conflicts []string `json:"conflicts,omitempty"`
 	// PinnedVia names the sibling binary (same source package) whose exact
@@ -150,6 +159,15 @@ func isGenerated(p string) bool {
 
 // Build measures files against the store.
 func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Filter) (*Report, error) {
+	return BuildWith(ctx, st, files, f, nil)
+}
+
+// BuildWith is Build plus an optional list of installed packages (name ->
+// version), e.g. from witness's system-packages attestation (dpkg-query).
+// Hashes stay the primary evidence; the dpkg list breaks ties between
+// versions the files cannot tell apart, flags disagreements, and supplies a
+// version when the installed one is missing from the index.
+func BuildWith(ctx context.Context, st *store.Store, files []attest.File, f store.Filter, installed map[string]string) (*Report, error) {
 	r := &Report{Filter: f, Attested: len(files), ByCategory: map[attest.Category]*Stat{}}
 	cat := map[string]attest.Category{}
 	var hashes []string
@@ -387,6 +405,35 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 		}
 	}
 
+	// Installed-packages list (dpkg). Applied after the hash logic, so it can
+	// only choose among versions the files allow, or flag a disagreement.
+	dpkgPinned := map[string]bool{}
+	mismatch := map[string]bool{}
+	dpkgOnly := map[string]string{}
+	if installed != nil {
+		indexed, err := st.Versions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for name, a := range pk {
+			d, ok := installed[name]
+			if a.anchors == 0 || !ok {
+				continue
+			}
+			switch {
+			case conflicted[name] != nil:
+				if !indexed[name][d] {
+					dpkgOnly[name] = d
+				}
+			case a.versions[d] && len(a.versions) > 1:
+				a.versions = map[string]bool{d: true}
+				dpkgPinned[name] = true
+			case !a.versions[d]:
+				mismatch[name] = true
+			}
+		}
+	}
+
 	// Assign each matched file to one identified package. Files shared by
 	// several packages (including high fan-out ones) go to the identified
 	// candidate with the most anchors, so they never create a package.
@@ -434,14 +481,31 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 		sort.Strings(p.Versions)
 		c := a.sample
 		c.Version = ""
+		if installed != nil {
+			p.Dpkg = installed[name]
+		}
 		switch {
+		case conflicted[name] != nil && dpkgOnly[name] != "":
+			p.Confidence = "dpkg_only"
+			p.Conflicts = conflicted[name]
+			p.Versions = []string{dpkgOnly[name]}
+			c.Version = dpkgOnly[name]
 		case conflicted[name] != nil:
 			p.Confidence = "conflict"
 			p.Conflicts = conflicted[name]
+		case mismatch[name]:
+			p.Confidence = "mismatch"
+			if len(p.Versions) == 1 {
+				c.Version = p.Versions[0]
+				p.Exact = true
+			}
 		case len(p.Versions) == 1:
 			c.Version = p.Versions[0]
 			p.Exact = true
 			p.Confidence = "exact"
+			if dpkgPinned[name] {
+				p.Confidence = "exact_dpkg"
+			}
 		default:
 			p.Confidence = "ambiguous"
 		}
@@ -522,9 +586,16 @@ func (r *Report) WriteText(w io.Writer, maxMisses int) {
 		if p.PinnedVia != "" {
 			via = " (pinned via " + p.PinnedVia + ")"
 		}
-		if p.Confidence == "conflict" {
+		switch p.Confidence {
+		case "conflict":
 			v = "version not in index"
 			via = " (contradicted by " + strings.Join(p.Conflicts, ", ") + ")"
+		case "exact_dpkg":
+			via += " (picked by dpkg among matching versions)"
+		case "dpkg_only":
+			via = " (dpkg's version, not in the index)"
+		case "mismatch":
+			via += " (dpkg says " + p.Dpkg + ")"
 		}
 		fmt.Fprintf(w, "  %-32s %-28s files=%-3d anchors=%d%s\n", p.Name, v, p.Files, p.Anchors, via)
 	}

@@ -390,6 +390,7 @@ func cmdEval(ctx context.Context, args []string) error {
 	arch := fs.String("arch", "", "only match this arch")
 	att := fs.String("attestation", "", "truth: attestation or system-files JSON")
 	dpkgPath := fs.String("dpkg", "", "truth: dpkg-query -W output (name<TAB>version)")
+	useDpkg := fs.Bool("use-dpkg", false, "truth: also give the dpkg list to the attribution, as a system-packages attestation would")
 	asJSON := fs.Bool("json", false, "print JSON")
 	maxWrong := fs.Int("wrong", 25, "list at most this many wrong answers (0 = all)")
 	if err := fs.Parse(args); err != nil {
@@ -426,7 +427,7 @@ func cmdEval(ctx context.Context, args []string) error {
 				return err
 			}
 		}
-		tr, err := eval.Truth(ctx, st, files, dpkg, filter)
+		tr, err := eval.Truth(ctx, st, files, dpkg, filter, *useDpkg)
 		if err != nil {
 			return err
 		}

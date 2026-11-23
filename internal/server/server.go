@@ -143,6 +143,16 @@ type AttributeRequest struct {
 	Files []attest.File `json:"files"`
 	// Hint narrows matching; empty fields are detected from the files.
 	Hint Hint `json:"hint"`
+	// Installed is the system's installed-package list, e.g. from witness's
+	// system-packages attestation. Optional: it breaks ties between versions
+	// the files can't tell apart and flags disagreements.
+	Installed []InstalledPackage `json:"installed,omitempty"`
+}
+
+// InstalledPackage is one entry of an installed-package list.
+type InstalledPackage struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
 }
 
 // AttributeResponse is the attribution plus the filter actually used.
@@ -195,7 +205,16 @@ func (s *srv) attribute(w http.ResponseWriter, r *http.Request) {
 	if filter.Arch == "" {
 		filter.Arch = detected.Arch
 	}
-	rep, err := report.Build(r.Context(), s.st, files, filter)
+	var installed map[string]string
+	if len(req.Installed) > 0 {
+		installed = make(map[string]string, len(req.Installed))
+		for _, p := range req.Installed {
+			if p.Name != "" && p.Version != "" {
+				installed[strings.SplitN(p.Name, ":", 2)[0]] = p.Version
+			}
+		}
+	}
+	rep, err := report.BuildWith(r.Context(), s.st, files, filter, installed)
 	if err != nil {
 		s.internal(w, err)
 		return

@@ -345,8 +345,15 @@ type TruthResult struct {
 
 // Truth runs the attribution on files and checks it against dpkg
 // (package name -> version).
-func Truth(ctx context.Context, st *store.Store, files []attest.File, dpkg map[string]string, f store.Filter) (*TruthResult, error) {
-	r, err := report.Build(ctx, st, files, f)
+//
+// With useDpkg, the dpkg list is also given to the attribution (as a
+// system-packages attestation would be), so it can break ties.
+func Truth(ctx context.Context, st *store.Store, files []attest.File, dpkg map[string]string, f store.Filter, useDpkg bool) (*TruthResult, error) {
+	var installed map[string]string
+	if useDpkg {
+		installed = dpkg
+	}
+	r, err := report.BuildWith(ctx, st, files, f, installed)
 	if err != nil {
 		return nil, err
 	}

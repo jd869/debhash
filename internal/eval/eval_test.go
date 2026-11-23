@@ -121,7 +121,7 @@ func TestTruth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr, err := Truth(context.Background(), st, files, dpkg, store.Filter{})
+	tr, err := Truth(context.Background(), st, files, dpkg, store.Filter{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}

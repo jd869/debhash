@@ -201,3 +201,70 @@ func TestConflictWhenInstalledVersionMissing(t *testing.T) {
 		t.Fatalf("want exact v2, got %+v", p)
 	}
 }
+
+// dpkg's installed list only decides what the files cannot.
+func TestInstalledListFromDpkg(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "idx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pub := store.Publication{Distro: "ubuntu", DistroVersion: "22.04", Suite: "jammy", Component: "main", Mirror: "m"}
+	add := func(name, version string, entries ...deb.Entry) {
+		t.Helper()
+		meta := store.PackageMeta{DebSHA256: h(name + version), Name: name, Version: version, Arch: "amd64", Source: name, SourceVersion: version}
+		if _, err := st.AddPackage(ctx, meta, pub, entries); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// base-files 4.4 and 4.5 ship an identical file the build touched.
+	add("base-files", "12ubuntu4.4", file("/usr/share/base-files/motd", "motd"), file("/usr/lib/os-release", "4.4"))
+	add("base-files", "12ubuntu4.5", file("/usr/share/base-files/motd", "motd"), file("/usr/lib/os-release", "4.5"))
+	// libssl3 1.1 and 1.2 differ in their library.
+	add("libssl3", "3.0.2-0ubuntu1.1", file("/usr/lib/x86_64-linux-gnu/libssl.so.3", "ssl 1.1"))
+	add("libssl3", "3.0.2-0ubuntu1.2", file("/usr/lib/x86_64-linux-gnu/libssl.so.3", "ssl 1.2"))
+	// zlib 1 is indexed; the installed zlib (2) is not.
+	add("zlib1g", "1", file("/usr/lib/x86_64-linux-gnu/libz.so.1", "zlib 1"), file("/usr/share/doc/zlib1g/copyright", "zlib"))
+
+	files := []attest.File{
+		{Path: "/usr/share/base-files/motd", SHA256: h("motd")},               // fits 4.4 and 4.5
+		{Path: "/usr/lib/x86_64-linux-gnu/libssl.so.3", SHA256: h("ssl 1.2")}, // only 1.2
+		{Path: "/usr/lib/x86_64-linux-gnu/libz.so.1", SHA256: h("zlib 2")},    // not indexed
+		{Path: "/usr/share/doc/zlib1g/copyright", SHA256: h("zlib")},
+	}
+	installed := map[string]string{"base-files": "12ubuntu4.4", "libssl3": "3.0.2-0ubuntu1.1", "zlib1g": "2"}
+
+	// Without the list: base-files ambiguous, libssl3 exact, zlib1g conflict.
+	plain, err := Build(ctx, st, files, store.Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	with, err := BuildWith(ctx, st, files, store.Filter{}, installed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := func(r *Report, name string) Package {
+		for _, p := range r.Packages {
+			if p.Name == name {
+				return p
+			}
+		}
+		t.Fatalf("%s not identified", name)
+		return Package{}
+	}
+	if get(plain, "base-files").Confidence != "ambiguous" || get(plain, "libssl3").Confidence != "exact" || get(plain, "zlib1g").Confidence != "conflict" {
+		t.Fatalf("plain = %+v", plain.Packages)
+	}
+	if p := get(with, "base-files"); p.Confidence != "exact_dpkg" || !p.Exact || p.Versions[0] != "12ubuntu4.4" {
+		t.Fatalf("base-files should be picked by dpkg: %+v", p)
+	}
+	// Files say 1.2, dpkg says 1.1: keep the files' answer, flag it.
+	if p := get(with, "libssl3"); p.Confidence != "mismatch" || p.Versions[0] != "3.0.2-0ubuntu1.2" || p.Dpkg != "3.0.2-0ubuntu1.1" {
+		t.Fatalf("libssl3 should be a mismatch: %+v", p)
+	}
+	// Installed version missing from the index: report dpkg's, unverified.
+	if p := get(with, "zlib1g"); p.Confidence != "dpkg_only" || p.Exact || p.Versions[0] != "2" || !strings.Contains(p.PURL, "zlib1g@2") {
+		t.Fatalf("zlib1g should be dpkg_only: %+v", p)
+	}
+}
