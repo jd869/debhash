@@ -78,6 +78,13 @@ type Package struct {
 	// otherwise PURL has no version and Versions lists the candidates.
 	Exact bool   `json:"exact"`
 	PURL  string `json:"purl"`
+	// Confidence is "exact" (one version, nothing contradicts it),
+	// "ambiguous" (several versions fit) or "conflict" (every candidate
+	// version is contradicted by an attested file: the installed version is
+	// most likely not in the index, so no version is claimed).
+	Confidence string `json:"confidence"`
+	// Conflicts are attested paths that contradicted the candidates.
+	Conflicts []string `json:"conflicts,omitempty"`
 	// PinnedVia names the sibling binary (same source package) whose exact
 	// version narrowed this one, when its own files were ambiguous.
 	PinnedVia string `json:"pinned_via,omitempty"`
@@ -302,6 +309,49 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 		}
 	}
 
+	// Conflict check. Intersecting matched hashes can narrow a package to a
+	// version that is merely the closest one indexed: if the installed
+	// version is missing, its files that never changed still point to a
+	// neighbour. So test every candidate against its own file list: an
+	// attested file at a path the candidate ships, with a different hash,
+	// rules the candidate out. Config under /etc, conffiles and generated
+	// files are skipped (they are edited locally).
+	attested := map[string]string{}
+	for _, file := range files {
+		if c := cat[file.Path]; c != attest.CatNotSystem && c != attest.CatPyc {
+			attested[file.Path] = file.SHA256
+		}
+	}
+	conflicted := map[string][]string{}
+	for name, a := range pk {
+		if a.anchors == 0 {
+			continue
+		}
+		keep := map[string]bool{}
+		var firstBad []string
+		for v := range a.versions {
+			m, err := st.DebManifest(ctx, name, v, f)
+			if err != nil {
+				return nil, err
+			}
+			if m == nil {
+				keep[v] = true // nothing to check against
+				continue
+			}
+			if bad := contradictions(m, attested); len(bad) == 0 {
+				keep[v] = true
+			} else if firstBad == nil || len(bad) < len(firstBad) {
+				firstBad = bad
+			}
+		}
+		switch {
+		case len(keep) == 0:
+			conflicted[name] = firstBad
+		case len(keep) < len(a.versions):
+			a.versions = keep
+		}
+	}
+
 	// Source-version propagation: binaries built from one source package are
 	// installed in lockstep (libc6-dev Depends: libc6 (= ${binary:Version})).
 	// Headers and docs rarely change between versions, so libc6-dev alone is
@@ -310,7 +360,7 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 	for changed := true; changed; {
 		changed = false
 		for name, a := range pk {
-			if a.anchors == 0 || len(a.versions) != 1 {
+			if a.anchors == 0 || len(a.versions) != 1 || conflicted[name] != nil {
 				continue
 			}
 			var v string
@@ -384,9 +434,16 @@ func Build(ctx context.Context, st *store.Store, files []attest.File, f store.Fi
 		sort.Strings(p.Versions)
 		c := a.sample
 		c.Version = ""
-		if len(p.Versions) == 1 {
+		switch {
+		case conflicted[name] != nil:
+			p.Confidence = "conflict"
+			p.Conflicts = conflicted[name]
+		case len(p.Versions) == 1:
 			c.Version = p.Versions[0]
 			p.Exact = true
+			p.Confidence = "exact"
+		default:
+			p.Confidence = "ambiguous"
 		}
 		p.PURL = store.PURL(c)
 		p.Matched = matched[name]
@@ -442,13 +499,20 @@ func (r *Report) WriteText(w io.Writer, maxMisses int) {
 		fmt.Fprintf(w, "Distro: /etc/os-release hash not in index\n")
 	}
 
-	pinned := 0
+	pinned, conflicts := 0, 0
 	for _, p := range r.Packages {
-		if len(p.Versions) == 1 {
+		if p.Exact {
 			pinned++
 		}
+		if p.Confidence == "conflict" {
+			conflicts++
+		}
 	}
-	fmt.Fprintf(w, "\nPackages identified: %d (%d with an exact version)\n", len(r.Packages), pinned)
+	fmt.Fprintf(w, "\nPackages identified: %d (%d with an exact version", len(r.Packages), pinned)
+	if conflicts > 0 {
+		fmt.Fprintf(w, ", %d whose installed version is not in the index", conflicts)
+	}
+	fmt.Fprintln(w, ")")
 	for _, p := range r.Packages {
 		v := strings.Join(p.Versions, " | ")
 		if len(p.Versions) > 3 {
@@ -457,6 +521,10 @@ func (r *Report) WriteText(w io.Writer, maxMisses int) {
 		via := ""
 		if p.PinnedVia != "" {
 			via = " (pinned via " + p.PinnedVia + ")"
+		}
+		if p.Confidence == "conflict" {
+			v = "version not in index"
+			via = " (contradicted by " + strings.Join(p.Conflicts, ", ") + ")"
 		}
 		fmt.Fprintf(w, "  %-32s %-28s files=%-3d anchors=%d%s\n", p.Name, v, p.Files, p.Anchors, via)
 	}
@@ -542,4 +610,39 @@ func DetectFilter(ctx context.Context, st *store.Store, files []attest.File) (st
 		}
 	}
 	return f, nil
+}
+
+// contradictions returns the attested paths whose content differs from what
+// manifest m ships at that path (following symlinks inside m), skipping
+// config that is routinely edited on the machine. At most 5 are returned.
+func contradictions(m *store.Manifest, attested map[string]string) []string {
+	var bad []string
+	for p, h := range attested {
+		if strings.HasPrefix(p, "/etc/") || isGenerated(p) {
+			continue
+		}
+		for _, v := range attest.Variants(p) {
+			target := v
+			for hop := 0; hop < 4; hop++ {
+				next, ok := m.Links[target]
+				if !ok {
+					break
+				}
+				target = next
+			}
+			want, ok := m.Files[target]
+			if !ok {
+				continue
+			}
+			if !m.Conffiles[target] && want != h {
+				bad = append(bad, p)
+			}
+			break
+		}
+	}
+	sort.Strings(bad)
+	if len(bad) > 5 {
+		bad = bad[:5]
+	}
+	return bad
 }

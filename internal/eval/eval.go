@@ -36,6 +36,10 @@ const (
 	Wrong Outcome = "wrong"
 	// NotFound: the package was not identified at all.
 	NotFound Outcome = "not_found"
+	// Flagged: identified, but every candidate version was contradicted, so
+	// no version was claimed ("installed version not in the index"). That
+	// is the right answer when the version really is missing.
+	Flagged Outcome = "flagged_not_indexed"
 	// Skipped: the strategy left no file to query.
 	Skipped Outcome = "skipped"
 )
@@ -74,8 +78,10 @@ type Summary struct {
 	// ExactWrong are the wrong answers that named a single version: the
 	// confident mistakes ("over-promises").
 	ExactWrong int `json:"exact_wrong"`
-	NotFound   int `json:"not_found"`
-	Skipped    int `json:"skipped"`
+	// Flagged answers said "installed version not in index".
+	Flagged  int `json:"flagged_not_indexed"`
+	NotFound int `json:"not_found"`
+	Skipped  int `json:"skipped"`
 	// MeanCandidates is the average candidate-set size of ambiguous answers.
 	MeanCandidates float64 `json:"mean_candidates_when_ambiguous"`
 }
@@ -221,6 +227,9 @@ func score(r *report.Report, name, version string) (Outcome, []string) {
 		if p.Name != name {
 			continue
 		}
+		if p.Confidence == "conflict" {
+			return Flagged, p.Versions
+		}
 		has := false
 		for _, v := range p.Versions {
 			if v == version {
@@ -261,6 +270,8 @@ func summarize(strategies []Strategy, cases []Case) []Summary {
 				}
 			case NotFound:
 				sum.NotFound++
+			case Flagged:
+				sum.Flagged++
 			case Skipped:
 				sum.Skipped++
 				continue
@@ -284,13 +295,14 @@ func WriteSummaries(w io.Writer, title string, sums []Summary) {
 		return fmt.Sprintf("%.1f%%", 100*float64(a)/float64(b))
 	}
 	fmt.Fprintln(w, title)
-	fmt.Fprintf(w, "%-9s %7s %15s %22s %13s %15s %13s %8s\n", "strategy", "queries", "exact+correct", "ambiguous (avg cands)", "wrong", "of which EXACT", "not found", "skipped")
+	fmt.Fprintf(w, "%-9s %7s %15s %22s %13s %15s %17s %13s %8s\n", "strategy", "queries", "exact+correct", "ambiguous (avg cands)", "wrong", "of which EXACT", "flagged missing", "not found", "skipped")
 	for _, s := range sums {
-		fmt.Fprintf(w, "%-9s %7d %8d %6s %8d %6s (%4.1f) %6d %6s %8d %6s %6d %6s %8d\n", s.Strategy, s.Queries,
+		fmt.Fprintf(w, "%-9s %7d %8d %6s %8d %6s (%4.1f) %6d %6s %8d %6s %10d %6s %6d %6s %8d\n", s.Strategy, s.Queries,
 			s.ExactCorrect, pct(s.ExactCorrect, s.Queries),
 			s.Ambiguous, pct(s.Ambiguous, s.Queries), s.MeanCandidates,
 			s.Wrong, pct(s.Wrong, s.Queries),
 			s.ExactWrong, pct(s.ExactWrong, s.Queries),
+			s.Flagged, pct(s.Flagged, s.Queries),
 			s.NotFound, pct(s.NotFound, s.Queries), s.Skipped)
 	}
 }

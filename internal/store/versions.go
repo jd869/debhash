@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	pathpkg "path"
 	"sort"
+	"strings"
 )
 
 // PackageDepth describes how many versions of one package are indexed, and
@@ -166,4 +168,56 @@ func (s *Store) Versions(ctx context.Context) (map[string]map[string]bool, error
 		out[n][v] = true
 	}
 	return out, rows.Err()
+}
+
+// Manifest is the file list of one package version, for checking attested
+// files against it.
+type Manifest struct {
+	Files     map[string]string // regular file path -> sha256
+	Links     map[string]string // symlink path -> absolute target
+	Conffiles map[string]bool
+}
+
+// DebManifest returns the file list of package name at version (respecting
+// the filter's suite/arch/exclusion), or nil if no such deb is indexed.
+func (s *Store) DebManifest(ctx context.Context, name, version string, f Filter) (*Manifest, error) {
+	sub := `SELECT p.id FROM packages p JOIN publications pub ON pub.package_id = p.id WHERE p.name = ? AND p.version = ?`
+	subArgs := []any{name, version}
+	sub, subArgs = f.apply(sub, subArgs)
+	q := `SELECT path, COALESCE(sha256, ''), kind, COALESCE(link_target, ''), conffile FROM files
+	      WHERE package_id = (` + sub + ` ORDER BY p.id LIMIT 1)`
+	rows, err := s.db.QueryContext(ctx, q, subArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	m := &Manifest{Files: map[string]string{}, Links: map[string]string{}, Conffiles: map[string]bool{}}
+	n := 0
+	for rows.Next() {
+		var p, sha, kind, target string
+		var conf bool
+		if err := rows.Scan(&p, &sha, &kind, &target, &conf); err != nil {
+			return nil, err
+		}
+		n++
+		switch {
+		case kind == "symlink" && target != "":
+			if !strings.HasPrefix(target, "/") {
+				target = pathpkg.Join(pathpkg.Dir(p), target)
+			}
+			m.Links[p] = pathpkg.Clean(target)
+		case sha != "":
+			m.Files[p] = sha
+		}
+		if conf {
+			m.Conffiles[p] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	return m, nil
 }

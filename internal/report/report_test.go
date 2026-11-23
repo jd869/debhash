@@ -143,3 +143,61 @@ func TestSourceVersionPropagationAndGenerated(t *testing.T) {
 		t.Fatalf("resolv.conf should be a generated miss: %+v", r.Misses)
 	}
 }
+
+// The installed libc6 (v3) is not indexed. Its copyright happens to equal
+// v2's, so hash intersection alone would answer "exactly v2". But v2 ships
+// libc.so.6 with a different hash than the attested one: v2 is contradicted
+// and no version must be claimed.
+func TestConflictWhenInstalledVersionMissing(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "idx.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	pub := store.Publication{Distro: "ubuntu", DistroVersion: "22.04", Suite: "jammy", Component: "main", Mirror: "m"}
+	for _, v := range []struct{ version, lib, doc string }{{"1", "libc v1", "doc v1"}, {"2", "libc v2", "doc v2+v3"}} {
+		meta := store.PackageMeta{DebSHA256: h("libc" + v.version), Name: "libc6", Version: v.version, Arch: "amd64", Source: "glibc", SourceVersion: v.version}
+		if _, err := st.AddPackage(ctx, meta, pub, []deb.Entry{
+			file("/lib/x86_64-linux-gnu/libc.so.6", v.lib),
+			{Path: "/lib/x86_64-linux-gnu/libc.so", Kind: deb.KindSymlink, LinkTarget: "libc.so.6"},
+			file("/usr/share/doc/libc6/changelog.gz", v.doc),
+			file("/etc/ld.so.conf.d/libc.conf", "conf"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	installedV3 := []attest.File{
+		{Path: "/usr/lib/x86_64-linux-gnu/libc.so", SHA256: h("libc v3")}, // through the symlink
+		{Path: "/usr/share/doc/libc6/changelog.gz", SHA256: h("doc v2+v3")},
+		{Path: "/etc/ld.so.conf.d/libc.conf", SHA256: h("edited locally")}, // /etc: never a conflict
+	}
+	r, err := Build(ctx, st, installedV3, store.Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Packages) != 1 {
+		t.Fatalf("packages = %+v", r.Packages)
+	}
+	p := r.Packages[0]
+	if p.Exact || p.Confidence != "conflict" || len(p.Conflicts) != 1 || p.Conflicts[0] != "/usr/lib/x86_64-linux-gnu/libc.so" {
+		t.Fatalf("want conflict on libc.so, got %+v", p)
+	}
+	if strings.Contains(p.PURL, "@") {
+		t.Fatalf("a contradicted package must not carry a version: %s", p.PURL)
+	}
+
+	// The same query for the indexed v2 is exact, and /etc edits don't matter.
+	installedV2 := []attest.File{
+		{Path: "/lib/x86_64-linux-gnu/libc.so.6", SHA256: h("libc v2")},
+		{Path: "/usr/share/doc/libc6/changelog.gz", SHA256: h("doc v2+v3")},
+		{Path: "/etc/ld.so.conf.d/libc.conf", SHA256: h("edited locally")},
+	}
+	r, err = Build(ctx, st, installedV2, store.Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := r.Packages[0]; !p.Exact || p.Confidence != "exact" || p.Versions[0] != "2" {
+		t.Fatalf("want exact v2, got %+v", p)
+	}
+}

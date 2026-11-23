@@ -87,10 +87,11 @@ func TestMissingCountsOverPromises(t *testing.T) {
 	if s.ExactCorrect != 0 || s.Queries != 6 {
 		t.Fatalf("missing = %+v", s)
 	}
-	// libc6 hidden: libc.so.6 no longer matches; the copyright still points
-	// to the 2 other versions -> wrong, but not exact. libc6-dev hidden: the
-	// header matches the 2 other versions -> wrong, not exact.
-	if s.Wrong != 6 || s.ExactWrong != 0 {
+	// libc6 hidden: its libc.so.6 contradicts both remaining versions, so
+	// it is flagged "installed version not in index" rather than answered.
+	// libc6-dev hidden: its header is identical in every version, so the
+	// other versions fit perfectly: wrong, but never exact.
+	if s.Flagged != 3 || s.Wrong != 3 || s.ExactWrong != 0 {
 		t.Fatalf("missing = %+v (%+v)", s, cases)
 	}
 }
