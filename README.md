@@ -32,6 +32,50 @@ carry no version. Their content hash can.
 - **Why history matters:** without it, rebuilt binaries (`libc.so.6`, `libssl.so.3`, `python3.12`) don't match, because the live mirror no longer carries the point release the runner had installed.
 - **Source-version propagation:** `libc.so.6` pins `libc6 2.39-0ubuntu8.6`, which also pins `libc-bin` and `libc6-dev` (93 headers that are identical across versions). Likewise, `libssl3t64` pins `openssl`.
 
+## Realistic version depth: Ubuntu 22.04 (jammy), every version since release
+
+The orjson index above only held 2 or 3 versions of most packages, which makes picking the right one easy. To test it properly, the [`jammy`](.github/workflows/jammy.yml) workflow:
+
+1. runs a small build under `witness run --trace -a system-packages` in six dated images, `ubuntu:jammy-20220428`, `-20230126`, `-20240111`, `-20250126`, `-20260109` and `-20261110`. The system-packages attestation records `dpkg-query`'s list, which is the ground truth.
+2. hashes every file of every installed package in each image;
+3. ingests every version of those 103 packages published since jammy's release (2022-04-21), from Launchpad.
+
+**Index depth:** 417 versions of 103 packages. Median 2 versions per package (many base packages never changed), p90 10, max 25 (`libssl3` 25, `libsystemd0` 18, `libc6` 16, `apt` 11).
+
+**Real images, checked against dpkg** (`debhash eval --mode truth`):
+
+| What was queried | Identified | Exact and correct | Ambiguous (right one included) | Wrong |
+|---|---|---|---|---|
+| Every installed file (each of the 6 images) | 101 of 101 | **101** | 0 | **0** |
+| Only what the traced build opened (each image) | 26 | **24 or 25** | 1 or 2 | **0** |
+| Same, with the system-packages list | 26 | **26** | 0 | **0** |
+
+**Every indexed version queried with its own files** (`debhash eval`):
+
+| Strategy | Exact and correct | Ambiguous (avg candidates) | Wrong |
+|---|---|---|---|
+| all files of the version | 100% (417) | 0% | 0 |
+| only libraries and executables | 98% | 2% (8) | 0 |
+| the files real builds opened | 95% | 5% (4) | 0 |
+| one random file | 54% | 37% (7.6) | 0 (9% not found) |
+
+**When the installed version is missing from the index** (`debhash eval --mode missing`, the version is hidden before the query):
+
+| Strategy | Exact but wrong, without the conflict check | With the conflict check | Flagged "not in index" |
+|---|---|---|---|
+| all files | 9.1% | **0%** | 69% |
+| only libraries and executables | 1.5% | **0%** | 16% |
+| the files real builds opened | 1.6% | 1.6% | 9% |
+
+The remaining 1.6% (2 cases, `base-files 12ubuntu4.4` and `4.5`) are builds that only touched files identical in both versions, so nothing in the attestation tells them apart. The system-packages list resolves them.
+
+**Storage:** 22,558 file rows, but only 12,234 distinct (package, path, sha256): 63% of paths never change between versions. Storing each path's content once with the range of versions that ship it would cut the rows by 46%. The bulk query is not a bottleneck: 1,668 evaluation queries run in under 3 seconds on a laptop.
+
+**Size of a full jammy amd64 index** (rough estimate from the `Contents` indexes):
+- jammy's release pocket ships 7.7M files; `jammy-updates` lists 55M, but **96% of those belong to versioned kernel packages** (`linux-modules-5.15.0-…`, `linux-azure-headers-…`, and so on), one new package per kernel build.
+- Everything over jammy's life: ~60 to 75M file rows (~15 to 20 GB in this SQLite layout).
+- Without versioned kernel packages, which container builds rarely touch: ~15 to 20M rows (~4 to 5 GB), before deduplicating unchanged files.
+
 ## How it works
 
 ```
@@ -111,6 +155,19 @@ Each ingest logs who signed every Release, e.g. `release noble-updates: signatur
 3. A package's version is the **intersection** of the versions allowed by each of its files. Unchanged files allow many versions; rebuilt binaries allow one.
 4. Files shipped by more than 5 packages never identify a package on their own.
 5. Generated `.pyc` files are attributed by path, via their `.py` source.
+6. **Conflict check:** each remaining candidate version is compared with its own file list. An attested file at a path the version ships, but with a different hash, rules it out (symlinks are followed; `/etc`, conffiles and generated files are skipped). If every candidate is ruled out, the package is reported as `conflict` with no version: the installed version is not in the index.
+7. **Installed-package list** (optional, e.g. witness's system-packages attestor): it picks between versions the files cannot tell apart (`exact_dpkg`), flags files that rule out dpkg's version (`mismatch`), and supplies dpkg's version when the index lacks it (`dpkg_only`). Hashes stay the primary evidence.
+
+Each package carries a `confidence`: `exact`, `exact_dpkg`, `ambiguous`, `conflict`, `dpkg_only` or `mismatch`.
+
+## Evaluating it
+
+```sh
+debhash stats --db idx.db --versions                     # depth, duplication, version-defining paths
+debhash eval  --db idx.db --strategies all,binaries,one  # each version queried with its own files
+debhash eval  --db idx.db --mode missing                 # same, with that version hidden
+debhash eval  --db idx.db --mode truth --attestation att.json --dpkg dpkg.tsv [--use-dpkg]
+```
 
 ## Development
 
