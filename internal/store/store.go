@@ -176,6 +176,9 @@ type Filter struct {
 	Distro string // ubuntu
 	Suite  string // noble: also matches noble-updates, noble-security, ...
 	Arch   string // arm64: also matches "all"
+	// ExcludePackageID hides one deb from lookups. The evaluation uses it to
+	// simulate an index that is missing the version actually installed.
+	ExcludePackageID int64 `json:"-"`
 }
 
 // Candidate is one (file, package, publication) that has a given sha256.
@@ -436,6 +439,10 @@ func (f Filter) apply(q string, args []any) (string, []any) {
 	if f.Arch != "" {
 		q += ` AND (p.arch = ? OR p.arch = 'all')`
 		args = append(args, f.Arch)
+	}
+	if f.ExcludePackageID != 0 {
+		q += ` AND p.id != ?`
+		args = append(args, f.ExcludePackageID)
 	}
 	return q, args
 }

@@ -26,6 +26,7 @@ import (
 
 	"github.com/jd869/debhash/internal/attest"
 	"github.com/jd869/debhash/internal/deb"
+	"github.com/jd869/debhash/internal/eval"
 	"github.com/jd869/debhash/internal/ingest"
 	"github.com/jd869/debhash/internal/keyring"
 	"github.com/jd869/debhash/internal/launchpad"
@@ -39,6 +40,7 @@ const usage = `debhash: map file sha256 digests to Debian/Ubuntu packages
 Commands:
   ingest   download .debs from a mirror and index every file's sha256
   report   measure how much of a witness attestation the index attributes
+  eval     check that attribution converges to the right version (known answers)
   lookup   look up sha256 digests in the index
   inspect  hash the files inside a local .deb (no database)
   serve    serve the index over HTTP
@@ -57,7 +59,7 @@ func main() {
 
 	cmds := map[string]func(context.Context, []string) error{
 		"ingest": cmdIngest, "report": cmdReport, "lookup": cmdLookup,
-		"inspect": cmdInspect, "serve": cmdServe, "stats": cmdStats,
+		"inspect": cmdInspect, "serve": cmdServe, "stats": cmdStats, "eval": cmdEval,
 	}
 	cmd, ok := cmds[os.Args[1]]
 	if !ok {
@@ -373,4 +375,105 @@ func writeVersionStats(w io.Writer, vs *store.VersionStats, dbSize int64) {
 	for _, d := range vs.Top {
 		fmt.Fprintf(w, "%-28s %9d %7d %16d\n", d.Name, d.Versions, d.Paths, d.Defining)
 	}
+}
+
+func cmdEval(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("eval", flag.ContinueOnError)
+	db := fs.String("db", "debhash.db", "SQLite database path")
+	mode := fs.String("mode", "synthetic", "synthetic (query each deb with its own files), missing (same, with that deb hidden) or truth (compare with a dpkg list)")
+	strategies := fs.String("strategies", "all,binaries,one", "synthetic/missing: all, binaries, one, touched")
+	var touchedFrom stringList
+	fs.Var(&touchedFrom, "touched", "attestation whose opened files define the 'touched' strategy; repeatable")
+	sample := fs.Int("sample", 0, "evaluate this many random debs (0 = all)")
+	seed := fs.Int64("seed", 1, "random seed for sampling and the 'one' strategy")
+	suite := fs.String("suite", "", "only match this suite")
+	arch := fs.String("arch", "", "only match this arch")
+	att := fs.String("attestation", "", "truth: attestation or system-files JSON")
+	dpkgPath := fs.String("dpkg", "", "truth: dpkg-query -W output (name<TAB>version)")
+	asJSON := fs.Bool("json", false, "print JSON")
+	maxWrong := fs.Int("wrong", 25, "list at most this many wrong answers (0 = all)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	st, err := openDB(*db)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	filter := store.Filter{Suite: *suite, Arch: *arch}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+
+	if *mode == "truth" {
+		if *att == "" || *dpkgPath == "" {
+			return errors.New("truth mode needs --attestation and --dpkg")
+		}
+		files, err := attest.ReadFile(*att)
+		if err != nil {
+			return err
+		}
+		df, err := os.Open(*dpkgPath)
+		if err != nil {
+			return err
+		}
+		dpkg, err := eval.ReadDpkg(df)
+		df.Close()
+		if err != nil {
+			return err
+		}
+		if filter == (store.Filter{}) {
+			if filter, err = report.DetectFilter(ctx, st, files); err != nil {
+				return err
+			}
+		}
+		tr, err := eval.Truth(ctx, st, files, dpkg, filter)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return enc.Encode(tr)
+		}
+		eval.WriteTruth(os.Stdout, *att, tr)
+		return nil
+	}
+
+	o := eval.Options{Filter: filter, Sample: *sample, Seed: *seed}
+	for _, s := range splitList(*strategies) {
+		o.Strategies = append(o.Strategies, eval.Strategy(s))
+	}
+	if len(touchedFrom) > 0 {
+		o.Touched = map[string]bool{}
+		for _, name := range touchedFrom {
+			files, err := attest.ReadFile(name)
+			if err != nil {
+				return err
+			}
+			for _, f := range files {
+				o.Touched[f.Path] = true
+			}
+		}
+	}
+	var sums []eval.Summary
+	var cases []eval.Case
+	switch *mode {
+	case "synthetic":
+		sums, cases, err = eval.Synthetic(ctx, st, o)
+	case "missing":
+		sums, cases, err = eval.Missing(ctx, st, o)
+	default:
+		return fmt.Errorf("--mode %q: want synthetic, missing or truth", *mode)
+	}
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return enc.Encode(map[string]any{"mode": *mode, "summaries": sums, "cases": cases})
+	}
+	title := "Each deb queried with its own files (right answer known):"
+	if *mode == "missing" {
+		title = "Each deb queried with its own files, with that deb HIDDEN (right answer absent; any exact answer is an over-promise):"
+	}
+	eval.WriteSummaries(os.Stdout, title, sums)
+	eval.WriteWrong(os.Stdout, cases, *maxWrong)
+	return nil
 }

@@ -120,3 +120,50 @@ func (s *Store) VersionStats(ctx context.Context) (*VersionStats, error) {
 	vs.Top = top[:min(10, len(top))]
 	return vs, nil
 }
+
+// Deb is one ingested package version.
+type Deb struct {
+	ID      int64
+	Name    string
+	Version string
+	Arch    string
+}
+
+// Debs lists every ingested deb, ordered by name and id.
+func (s *Store) Debs(ctx context.Context) ([]Deb, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, version, arch FROM packages ORDER BY name, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Deb
+	for rows.Next() {
+		var d Deb
+		if err := rows.Scan(&d.ID, &d.Name, &d.Version, &d.Arch); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// Versions returns every indexed version of every package, by name.
+func (s *Store) Versions(ctx context.Context) (map[string]map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT name, version FROM packages`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]map[string]bool{}
+	for rows.Next() {
+		var n, v string
+		if err := rows.Scan(&n, &v); err != nil {
+			return nil, err
+		}
+		if out[n] == nil {
+			out[n] = map[string]bool{}
+		}
+		out[n][v] = true
+	}
+	return out, rows.Err()
+}
