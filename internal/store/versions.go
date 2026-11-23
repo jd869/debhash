@@ -1,0 +1,122 @@
+package store
+
+import (
+	"context"
+	"sort"
+)
+
+// PackageDepth describes how many versions of one package are indexed, and
+// how many of its files actually change between them.
+type PackageDepth struct {
+	Name     string `json:"name"`
+	Versions int    `json:"versions"`
+	// Paths is the number of distinct file paths across all versions.
+	Paths int `json:"paths"`
+	// Defining is how many of those paths have more than one distinct hash
+	// across the indexed versions: the files that can tell versions apart.
+	Defining int `json:"version_defining_paths"`
+}
+
+// VersionStats answers "how deep is the index": versions per package, and
+// how much of the stored data is repeated across versions.
+type VersionStats struct {
+	Packages int `json:"packages"`
+	Debs     int `json:"debs"`
+
+	VersionsMin    int     `json:"versions_min"`
+	VersionsMedian float64 `json:"versions_median"`
+	VersionsP90    int     `json:"versions_p90"`
+	VersionsMax    int     `json:"versions_max"`
+
+	// FileRows is one row per (deb, file): what the files table stores today.
+	FileRows int `json:"file_rows"`
+	// DistinctContent is the number of distinct (package, path, sha256):
+	// what storing each file content once per package would need.
+	DistinctContent int `json:"distinct_package_path_hash"`
+	// Duplication is FileRows / DistinctContent.
+	Duplication float64 `json:"duplication"`
+	// StablePaths is the share of (package, path) pairs whose content is the
+	// same in every indexed version of the package.
+	StablePaths float64 `json:"stable_path_share"`
+
+	Top []PackageDepth `json:"deepest_packages"`
+	All []PackageDepth `json:"packages_detail"`
+}
+
+// VersionStats computes depth and duplication figures for the whole index.
+func (s *Store) VersionStats(ctx context.Context) (*VersionStats, error) {
+	vs := &VersionStats{}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM packages`).Scan(&vs.Debs); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM files WHERE sha256 IS NOT NULL`).Scan(&vs.FileRows); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM (
+		SELECT DISTINCT p.name, f.path, f.sha256 FROM files f JOIN packages p ON p.id = f.package_id
+		WHERE f.sha256 IS NOT NULL)`).Scan(&vs.DistinctContent); err != nil {
+		return nil, err
+	}
+	if vs.DistinctContent > 0 {
+		vs.Duplication = float64(vs.FileRows) / float64(vs.DistinctContent)
+	}
+
+	// Per package: versions, paths, and paths with more than one hash.
+	rows, err := s.db.QueryContext(ctx, `
+		WITH v AS (SELECT name, COUNT(DISTINCT version) AS versions FROM packages GROUP BY name),
+		     ph AS (SELECT p.name, f.path, COUNT(DISTINCT f.sha256) AS hashes
+		            FROM files f JOIN packages p ON p.id = f.package_id
+		            WHERE f.sha256 IS NOT NULL GROUP BY p.name, f.path)
+		SELECT v.name, v.versions,
+		       COALESCE((SELECT COUNT(*) FROM ph WHERE ph.name = v.name), 0),
+		       COALESCE((SELECT COUNT(*) FROM ph WHERE ph.name = v.name AND ph.hashes > 1), 0)
+		FROM v ORDER BY v.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var paths, stable int
+	for rows.Next() {
+		var d PackageDepth
+		if err := rows.Scan(&d.Name, &d.Versions, &d.Paths, &d.Defining); err != nil {
+			return nil, err
+		}
+		vs.All = append(vs.All, d)
+		paths += d.Paths
+		stable += d.Paths - d.Defining
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	vs.Packages = len(vs.All)
+	if paths > 0 {
+		vs.StablePaths = float64(stable) / float64(paths)
+	}
+	if len(vs.All) == 0 {
+		return vs, nil
+	}
+
+	counts := make([]int, len(vs.All))
+	for i, d := range vs.All {
+		counts[i] = d.Versions
+	}
+	sort.Ints(counts)
+	n := len(counts)
+	vs.VersionsMin, vs.VersionsMax = counts[0], counts[n-1]
+	if n%2 == 1 {
+		vs.VersionsMedian = float64(counts[n/2])
+	} else {
+		vs.VersionsMedian = float64(counts[n/2-1]+counts[n/2]) / 2
+	}
+	vs.VersionsP90 = counts[min(n-1, (n*9)/10)]
+
+	top := append([]PackageDepth(nil), vs.All...)
+	sort.Slice(top, func(i, j int) bool {
+		if top[i].Versions != top[j].Versions {
+			return top[i].Versions > top[j].Versions
+		}
+		return top[i].Name < top[j].Name
+	})
+	vs.Top = top[:min(10, len(top))]
+	return vs, nil
+}

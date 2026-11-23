@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -98,7 +99,8 @@ func cmdIngest(ctx context.Context, args []string) error {
 	pockets := fs.String("pockets", "release,updates,security", "comma-separated pockets")
 	components := fs.String("components", "main,universe", "comma-separated components")
 	arch := fs.String("arch", "arm64", "architecture")
-	pathsFrom := fs.String("paths-from", "", "witness attestation: only ingest packages shipping its files")
+	var pathsFrom stringList
+	fs.Var(&pathsFrom, "paths-from", "witness attestation (or JSON of path -> sha256): only ingest packages shipping its files; repeatable")
 	all := fs.Bool("all", false, "ingest every package in the selected pockets/components")
 	workers := fs.Int("workers", 4, "parallel downloads")
 	keyringPath := fs.String("keyring", "", "OpenPGP keyring that signs the archive (default: embedded Ubuntu archive keyring; e.g. /usr/share/keyrings/debian-archive-keyring.gpg for Debian)")
@@ -147,10 +149,20 @@ func cmdIngest(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("--history %q: only \"launchpad\" is supported", *history)
 	}
-	if *pathsFrom != "" && !*all {
-		files, err := attest.ReadFile(*pathsFrom)
-		if err != nil {
-			return err
+	if len(pathsFrom) > 0 && !*all {
+		seen := map[string]bool{}
+		var files []attest.File
+		for _, name := range pathsFrom {
+			fs, err := attest.ReadFile(name)
+			if err != nil {
+				return err
+			}
+			for _, f := range fs {
+				if !seen[f.Path] {
+					seen[f.Path] = true
+					files = append(files, f)
+				}
+			}
 		}
 		for _, f := range files {
 			if c := attest.Classify(f.Path); c != attest.CatNotSystem && c != attest.CatPyc {
@@ -162,7 +174,7 @@ func cmdIngest(ctx context.Context, args []string) error {
 				}
 			}
 		}
-		fmt.Fprintf(os.Stderr, "targeting %d system paths from %s\n", len(opts.Targets), *pathsFrom)
+		fmt.Fprintf(os.Stderr, "targeting %d system paths from %s\n", len(opts.Targets), strings.Join(pathsFrom, ", "))
 	}
 	st, err := openDB(*db)
 	if err != nil {
@@ -309,6 +321,8 @@ func cmdServe(ctx context.Context, args []string) error {
 func cmdStats(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	db := fs.String("db", "debhash.db", "SQLite database path")
+	versions := fs.Bool("versions", false, "report version depth and duplication instead of coverage")
+	asJSON := fs.Bool("json", false, "with --versions: print JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -317,6 +331,23 @@ func cmdStats(ctx context.Context, args []string) error {
 		return err
 	}
 	defer st.Close()
+	if *versions {
+		vs, err := st.VersionStats(ctx)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(vs)
+		}
+		size := int64(0)
+		if fi, err := os.Stat(*db); err == nil {
+			size = fi.Size()
+		}
+		writeVersionStats(os.Stdout, vs, size)
+		return nil
+	}
 	s, err := st.Stats(ctx)
 	if err != nil {
 		return err
@@ -325,4 +356,21 @@ func cmdStats(ctx context.Context, args []string) error {
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	return enc.Encode(s)
+}
+
+// stringList is a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ",") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
+
+func writeVersionStats(w io.Writer, vs *store.VersionStats, dbSize int64) {
+	fmt.Fprintf(w, "Packages: %d   debs (package versions): %d   database: %.1f MB\n", vs.Packages, vs.Debs, float64(dbSize)/1e6)
+	fmt.Fprintf(w, "Versions per package: min %d, median %.1f, p90 %d, max %d\n", vs.VersionsMin, vs.VersionsMedian, vs.VersionsP90, vs.VersionsMax)
+	fmt.Fprintf(w, "File rows: %d   distinct (package, path, hash): %d   duplication: %.1fx\n", vs.FileRows, vs.DistinctContent, vs.Duplication)
+	fmt.Fprintf(w, "Paths whose content never changes across versions: %.0f%%\n\n", 100*vs.StablePaths)
+	fmt.Fprintf(w, "%-28s %9s %7s %16s\n", "deepest packages", "versions", "paths", "version-defining")
+	for _, d := range vs.Top {
+		fmt.Fprintf(w, "%-28s %9d %7d %16d\n", d.Name, d.Versions, d.Paths, d.Defining)
+	}
 }

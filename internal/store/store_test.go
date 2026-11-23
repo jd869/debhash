@@ -113,3 +113,40 @@ func TestPURLEpochAndArchAll(t *testing.T) {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
 }
+
+func TestVersionStats(t *testing.T) {
+	ctx := context.Background()
+	s := open(t)
+	// libc6 in 3 versions: libc.so.6 changes every time, the copyright never.
+	for i, v := range []string{"2.35-0ubuntu3", "2.35-0ubuntu3.1", "2.35-0ubuntu3.8"} {
+		meta := PackageMeta{DebSHA256: "libc" + v, Name: "libc6", Version: v, Arch: "amd64", Source: "glibc", SourceVersion: v}
+		if _, err := s.AddPackage(ctx, meta, noble, []deb.Entry{
+			{Path: "/usr/lib/x86_64-linux-gnu/libc.so.6", Kind: deb.KindFile, SHA256: string(rune('a' + i))},
+			{Path: "/usr/share/doc/libc6/copyright", Kind: deb.KindFile, SHA256: "cc"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.AddPackage(ctx, PackageMeta{DebSHA256: "tz", Name: "tzdata", Version: "2024a"}, noble,
+		[]deb.Entry{{Path: "/usr/share/zoneinfo/UTC", Kind: deb.KindFile, SHA256: "utc"}}); err != nil {
+		t.Fatal(err)
+	}
+	vs, err := s.VersionStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vs.Packages != 2 || vs.Debs != 4 || vs.VersionsMin != 1 || vs.VersionsMax != 3 || vs.VersionsMedian != 2 {
+		t.Fatalf("depth = %+v", vs)
+	}
+	// 7 file rows, 5 distinct (package, path, hash): 3 libc.so.6 + 1 copyright + 1 UTC.
+	if vs.FileRows != 7 || vs.DistinctContent != 5 {
+		t.Fatalf("rows=%d distinct=%d", vs.FileRows, vs.DistinctContent)
+	}
+	// Paths: libc.so.6 (defining), copyright (stable), UTC (stable) -> 2/3 stable.
+	if vs.Top[0].Name != "libc6" || vs.Top[0].Defining != 1 || vs.Top[0].Paths != 2 {
+		t.Fatalf("top = %+v", vs.Top[0])
+	}
+	if vs.StablePaths < 0.66 || vs.StablePaths > 0.67 {
+		t.Fatalf("stable share = %v", vs.StablePaths)
+	}
+}

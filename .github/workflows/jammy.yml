@@ -1,0 +1,179 @@
+# Realistic version depth on Ubuntu 22.04 (jammy), amd64.
+#
+# 1. attest: in ubuntu:jammy-YYYYMMDD images from across jammy's life, run a
+#    small build under `witness run --trace` (with the system-packages
+#    attestor, i.e. dpkg's installed list as ground truth), and hash every
+#    file of every installed package.
+# 2. index: ingest every version of those packages published since jammy's
+#    release (Launchpad history), report version depth, and run the
+#    attribution against each image.
+#
+# Run it from the Actions tab: "jammy" -> "Run workflow".
+name: jammy
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: ubuntu:jammy-* image dates, space-separated
+        default: "20220428 20230126 20240111 20250126 20260109 20261110"
+      after:
+        description: history window start (YYYY-MM-DD); jammy was released 2022-04-21
+        default: "2022-04-21"
+      before:
+        description: history window end (YYYY-MM-DD); empty means today
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  WITNESS_VERSION: "0.12.0"
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.m.outputs.tags }}
+    steps:
+      - id: m
+        env:
+          TAGS: ${{ inputs.tags }}
+        run: |
+          # Only accept image dates like 20240111 or 20231211.1.
+          json=$(printf '%s\n' $TAGS | grep -E '^[0-9]{8}(\.[0-9]+)?$' | jq -R . | jq -cs .)
+          test "$json" != "[]"
+          echo "tags=$json" >> "$GITHUB_OUTPUT"
+
+  attest:
+    needs: matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.matrix.outputs.tags) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch witness and check its checksum
+        run: |
+          base=https://github.com/in-toto/witness/releases/download/v${WITNESS_VERSION}
+          tarball=witness_${WITNESS_VERSION}_linux_amd64.tar.gz
+          curl -fsSL -o "$tarball" "$base/$tarball"
+          curl -fsSL -o checksums.txt "$base/witness_${WITNESS_VERSION}_checksums.txt"
+          grep " ${tarball}\$" checksums.txt | sha256sum -c -
+          mkdir -p witness-bin && tar -xzf "$tarball" -C witness-bin
+          test -x witness-bin/witness
+          # Throwaway signing key: these attestations are test data.
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out key.pem
+
+      - name: Build under witness in ubuntu:jammy-${{ matrix.tag }}
+        env:
+          TAG: ${{ matrix.tag }}
+        run: |
+          mkdir -p out
+          image="ubuntu:jammy-${TAG}"
+          docker pull "$image"
+          docker inspect --format '{{index .RepoDigests 0}}' "$image" > out/image-digest.txt
+          # ptrace is needed for --trace; files go to /out.
+          docker run --rm --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
+            -v "$PWD/witness-bin/witness:/usr/local/bin/witness:ro" \
+            -v "$PWD/key.pem:/key.pem:ro" \
+            -v "$PWD/scripts:/scripts:ro" \
+            -v "$PWD/out:/out" \
+            -w /tmp \
+            "$image" bash -c '
+              set -u
+              if witness run --step build --trace -a environment,system-packages \
+                   --signer-file-key-path /key.pem -o /out/attestation.json -- bash /scripts/jammy-build.sh; then
+                echo ok > /out/witness-status.txt
+              else
+                echo "failed: $?" > /out/witness-status.txt
+              fi
+              dpkg-query -W -f "\${Package}\t\${Version}\t\${Architecture}\n" > /out/dpkg.tsv
+              bash /scripts/hash-system.sh > /out/system-files.json
+            '
+          echo "witness: $(cat out/witness-status.txt)"
+          echo "installed packages: $(wc -l < out/dpkg.tsv)"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jammy-${{ matrix.tag }}
+          path: out/
+          retention-days: 14
+
+  index:
+    needs: attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: jammy-*
+          path: images
+
+      - name: Ingest jammy history for every package the images use
+        env:
+          AFTER: ${{ inputs.after }}
+          BEFORE: ${{ inputs.before }}
+        run: |
+          before=${BEFORE:-$(date -u +%F)}
+          mkdir -p data
+          go build -o debhash ./cmd/debhash
+          args=()
+          for f in images/*/attestation.json images/*/system-files.json; do
+            [ -s "$f" ] && args+=(--paths-from "$f")
+          done
+          ./debhash ingest --db data/jammy-amd64.db \
+            --mirror http://archive.ubuntu.com/ubuntu --suite jammy --arch amd64 \
+            --pockets release,updates,security --components main,universe --workers 6 \
+            --history launchpad --history-after "$AFTER" --history-before "$before" \
+            "${args[@]}" 2>&1 | tee data/ingest.log
+
+      - name: Version depth and attribution per image
+        run: |
+          ./debhash stats --db data/jammy-amd64.db --versions | tee data/version-stats.txt
+          ./debhash stats --db data/jammy-amd64.db --versions --json > data/version-stats.json
+          for dir in images/jammy-*; do
+            tag=${dir#images/jammy-}
+            for kind in attestation system-files; do
+              [ -s "$dir/$kind.json" ] || continue
+              ./debhash report --db data/jammy-amd64.db --attestation "$dir/$kind.json" --misses 0 \
+                > "data/report-$tag-$kind.txt" 2>&1 || true
+            done
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Version depth (jammy amd64)'; echo '```'; cat data/version-stats.txt 2>/dev/null; echo '```'
+            for f in data/report-*-system-files.txt; do
+              [ -f "$f" ] || continue
+              echo "### ${f#data/report-}"; echo '```'
+              grep -E '^(detected|  hits|  exact version|Distro|Packages identified|Misses)' "$f"; echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jammy-amd64-index
+          path: |
+            data/
+            images/
+          retention-days: 14
